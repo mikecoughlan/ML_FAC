@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# folders that are too big
+plots/
+models/
+outputs/
+shap/
+*.png
+*.mp4
