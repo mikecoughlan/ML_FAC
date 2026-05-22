@@ -7,11 +7,18 @@ AMPERE ground-truth data over a complete test set.
 For each of the 1200 pixels in a 50×24 (colatitude × MLT) FAC grid, this
 module produces a 50×24 correlation map showing how strongly every other
 pixel co-varies with that reference pixel across all test-set samples.  The
-computation is carried out for three quantities stored in the results pickle:
+computation is carried out for three quantities extracted from the results
+pickle:
 
-    • "predicted"  – ACORN posterior mean  (50×24 float)
-    • "std"        – ACORN posterior std   (50×24 float)
-    • "ampere"     – AMPERE ground truth   (50×24 float)
+    • "predicted"[0]  – ACORN posterior mean  (50×24 float, index 0 of the
+                         (2, 50, 24) array stored under the "predicted" key)
+    • "predicted"[1]  – ACORN posterior std   (50×24 float, index 1 of the
+                         same array)
+    • "ampere"        – AMPERE ground truth   (50×24 float)
+
+The "predicted" value in each per-timestamp sub-dictionary must therefore
+have shape (2, 50, 24).  The two planes are split automatically; no separate
+"std" key is expected or used.
 
 The full per-pixel correlation tensor has shape (1200, 50, 24), which is
 equivalent to the (1200×1200) Pearson correlation matrix reshaped for spatial
@@ -19,13 +26,15 @@ visualisation.
 
 Output files (written to --output-dir, default: current directory)
 -------------------------------------------------------------------
-    spatial_corr_predicted.npy    – float32 array (1200, 50, 24)
-    spatial_corr_std.npy          – float32 array (1200, 50, 24)
-    spatial_corr_ampere.npy       – float32 array (1200, 50, 24)
-    corr_matrix_predicted.npy     – float32 array (1200, 1200)   [optional]
-    corr_matrix_std.npy           – float32 array (1200, 1200)   [optional]
-    corr_matrix_ampere.npy        – float32 array (1200, 1200)   [optional]
-    spatial_correlation_meta.json – run metadata (timestamps, shapes, …)
+    spatial_corr_predicted_mean.npy – float32 array (1200, 50, 24)
+    spatial_corr_predicted_std.npy  – float32 array (1200, 50, 24)
+    spatial_corr_ampere.npy         – float32 array (1200, 50, 24)
+    spatial_corr_residual.npy       – float32 array (1200, 50, 24)
+    corr_matrix_predicted_mean.npy  – float32 array (1200, 1200)   [optional]
+    corr_matrix_predicted_std.npy   – float32 array (1200, 1200)   [optional]
+    corr_matrix_ampere.npy          – float32 array (1200, 1200)   [optional]
+    corr_matrix_residual.npy        – float32 array (1200, 1200)   [optional]
+    spatial_correlation_meta.json   – run metadata (timestamps, shapes, …)
 
 Usage
 -----
@@ -88,12 +97,13 @@ def load_results(pickle_path: str | Path) -> Dict:
     accepted).  Each value must itself be a dictionary with at least the
     following keys:
 
-        "predicted"  : numpy array of shape (50, 24) – ACORN posterior mean
-        "std"        : numpy array of shape (50, 24) – ACORN posterior std
+        "predicted"  : numpy array of shape (2, 50, 24)
+                       [0, :, :] → ACORN posterior mean
+                       [1, :, :] → ACORN posterior std
         "ampere"     : numpy array of shape (50, 24) – AMPERE ground truth
 
-    Missing keys for a given timestamp are handled gracefully: that timestamp
-    is skipped for the affected quantity with a warning.
+    Missing or malformed entries for a given timestamp are skipped with a
+    warning.
 
     Parameters
     ----------
@@ -128,40 +138,114 @@ def load_results(pickle_path: str | Path) -> Dict:
     return data
 
 
-def extract_stacked_arrays(
+def extract_predicted_arrays(
     results: Dict,
-    key: str,
-    expected_shape: Tuple[int, int] = (GRID_ROWS, GRID_COLS),
-) -> Tuple[np.ndarray, list]:
-    """Extract and stack all arrays for a given quantity key.
+) -> Tuple[np.ndarray, np.ndarray, list]:
+    """Extract and stack ACORN posterior mean and std from the ``"predicted"`` key.
 
-    Iterates over every timestamp in *results*, reads ``results[ts][key]``,
-    validates the shape, and stacks valid entries into a single array of shape
-    ``(N, *expected_shape)``.
+    Each per-timestamp entry is expected to store a ``(2, 50, 24)`` array
+    under the key ``"predicted"``, where:
+
+        ``entry["predicted"][0]``  → posterior mean  (50×24)
+        ``entry["predicted"][1]``  → posterior std   (50×24)
 
     Parameters
     ----------
     results : dict
         Top-level results dictionary (timestamp → sub-dict).
-    key : str
-        Sub-dictionary key to extract (e.g. ``"predicted"``, ``"std"``,
-        ``"ampere"``).
-    expected_shape : tuple of int, optional
-        Expected spatial shape of each map.  Defaults to ``(50, 24)``.
 
     Returns
     -------
-    stacked : np.ndarray, shape (N, rows, cols)
-        Float64 array of all valid maps for this key.
+    means : np.ndarray, shape (N, 50, 24)
+        Float64 array of posterior mean maps for all valid timestamps.
+    stds : np.ndarray, shape (N, 50, 24)
+        Float64 array of posterior std maps for all valid timestamps.
     valid_timestamps : list
-        Ordered list of timestamps whose maps were successfully extracted.
+        Ordered list of timestamps that were successfully extracted.
 
     Warns
     -----
     UserWarning
-        For timestamps where the key is missing or the array has the wrong
-        shape.  These timestamps are silently skipped.
+        For timestamps where ``"predicted"`` is missing or has an unexpected
+        shape.  Those timestamps are skipped for both outputs.
     """
+    expected_shape = (2, GRID_ROWS, GRID_COLS)
+    mean_arrays = []
+    std_arrays  = []
+    valid_timestamps = []
+
+    for ts, entry in results.items():
+        if not isinstance(entry, dict):
+            warnings.warn(
+                f"Timestamp {ts!r}: expected a dict, got "
+                f"{type(entry).__name__!r} – skipping.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+
+        if "predicted" not in entry:
+            warnings.warn(
+                f"Timestamp {ts!r}: key 'predicted' not found – skipping.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+
+        arr = np.asarray(entry["predicted"], dtype=np.float64)
+
+        if arr.shape != expected_shape:
+            warnings.warn(
+                f"Timestamp {ts!r}, key 'predicted': expected shape "
+                f"{expected_shape}, got {arr.shape} – skipping.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+
+        mean_arrays.append(arr[0])  # (50, 24) – posterior mean
+        std_arrays.append(arr[1])   # (50, 24) – posterior std
+        valid_timestamps.append(ts)
+
+    if not mean_arrays:
+        raise ValueError(
+            "No valid 'predicted' arrays found.  "
+            "Check that each timestamp entry contains a (2, 50, 24) array "
+            "under the 'predicted' key."
+        )
+
+    means = np.stack(mean_arrays, axis=0)  # (N, 50, 24)
+    stds  = np.stack(std_arrays,  axis=0)  # (N, 50, 24)
+    return means, stds, valid_timestamps
+
+
+def extract_ampere_arrays(
+    results: Dict,
+) -> Tuple[np.ndarray, list]:
+    """Extract and stack AMPERE ground-truth maps from the ``"ampere"`` key.
+
+    Each per-timestamp entry is expected to store a ``(50, 24)`` array under
+    the key ``"ampere"``.
+
+    Parameters
+    ----------
+    results : dict
+        Top-level results dictionary (timestamp → sub-dict).
+
+    Returns
+    -------
+    stacked : np.ndarray, shape (N, 50, 24)
+        Float64 array of AMPERE maps for all valid timestamps.
+    valid_timestamps : list
+        Ordered list of timestamps that were successfully extracted.
+
+    Warns
+    -----
+    UserWarning
+        For timestamps where ``"ampere"`` is missing or has an unexpected
+        shape.  Those timestamps are skipped.
+    """
+    expected_shape = (GRID_ROWS, GRID_COLS)
     arrays = []
     valid_timestamps = []
 
@@ -175,19 +259,19 @@ def extract_stacked_arrays(
             )
             continue
 
-        if key not in entry:
+        if "ampere" not in entry:
             warnings.warn(
-                f"Timestamp {ts!r}: key {key!r} not found – skipping.",
+                f"Timestamp {ts!r}: key 'ampere' not found – skipping.",
                 UserWarning,
                 stacklevel=2,
             )
             continue
 
-        arr = np.asarray(entry[key], dtype=np.float64)
+        arr = np.asarray(entry["ampere"], dtype=np.float64)
 
         if arr.shape != expected_shape:
             warnings.warn(
-                f"Timestamp {ts!r}, key {key!r}: expected shape "
+                f"Timestamp {ts!r}, key 'ampere': expected shape "
                 f"{expected_shape}, got {arr.shape} – skipping.",
                 UserWarning,
                 stacklevel=2,
@@ -199,11 +283,12 @@ def extract_stacked_arrays(
 
     if not arrays:
         raise ValueError(
-            f"No valid arrays found for key {key!r}.  "
-            "Check that the pickle has the expected structure."
+            "No valid 'ampere' arrays found.  "
+            "Check that each timestamp entry contains a (50, 24) array "
+            "under the 'ampere' key."
         )
 
-    stacked = np.stack(arrays, axis=0)  # (N, rows, cols)
+    stacked = np.stack(arrays, axis=0)  # (N, 50, 24)
     return stacked, valid_timestamps
 
 
@@ -399,9 +484,12 @@ def run(
 ) -> Dict:
     """End-to-end spatial correlation pipeline.
 
-    Loads the test-set results pickle, computes the full Pearson spatial
-    correlation matrix for ``"predicted"``, ``"std"``, and ``"ampere"``
-    quantities, and saves per-pixel correlation maps as ``.npy`` files.
+    Loads the test-set results pickle, extracts ACORN posterior mean and std
+    from the ``"predicted"`` key (shape ``(2, 50, 24)``) and AMPERE ground
+    truth from the ``"ampere"`` key (shape ``(50, 24)``), computes the full
+    Pearson spatial correlation matrix for each quantity — including the
+    per-pixel residual (predicted mean − AMPERE) for timestamps common to
+    both — and saves per-pixel correlation maps as ``.npy`` files.
 
     Parameters
     ----------
@@ -440,31 +528,112 @@ def run(
     print(f"  Found {len(results)} timestamps in pickle.")
 
     # ── 2. Compute & save ───────────────────────────────────────────────────
-    quantities = ["predicted", "std", "ampere"]
     meta_quantities = {}
     saved_paths_all = {}
 
-    for i, qty in enumerate(quantities, start=1):
-        print(f"\n[ 2.{i} / 3 ]  Processing quantity: {qty!r} …")
+    # -- 2a. ACORN predicted mean & std (both extracted from "predicted") ----
+    print("\n[ 2.1 / 3 ]  Extracting 'predicted' arrays (mean + std) …")
+    pred_means, pred_stds, pred_ts = extract_predicted_arrays(results)
+    print(f"  Valid samples : {pred_means.shape[0]}")
 
-        maps, valid_ts = extract_stacked_arrays(results, key=qty)
-        N = maps.shape[0]
-        print(f"  Valid samples : {N}")
-
-        print("  Computing Pearson correlation matrix …", end="", flush=True)
-        corr_mat = compute_correlation_matrix(maps, nan_policy=nan_policy)
+    for label, maps in (("predicted_mean", pred_means), ("predicted_std", pred_stds)):
+        print(f"\n  → Computing correlation for {label!r} …", end="", flush=True)
+        corr_mat  = compute_correlation_matrix(maps, nan_policy=nan_policy)
         print(" done.")
+        corr_maps = corr_matrix_to_maps(corr_mat)
 
+        print("    Saving …")
+        saved_paths = save_arrays(
+            output_dir, corr_maps, corr_mat, label, save_matrix=save_matrices
+        )
+        saved_paths_all[label] = saved_paths
+
+        meta_quantities[label] = {
+            "source_key": "predicted",
+            "source_index": 0 if label == "predicted_mean" else 1,
+            "n_samples": int(pred_means.shape[0]),
+            "n_zero_variance_pixels": int(np.isnan(corr_maps).any(axis=(1, 2)).sum()),
+            "corr_range": [
+                float(np.nanmin(corr_maps)),
+                float(np.nanmax(corr_maps)),
+            ],
+            "saved_files": saved_paths,
+        }
+
+    # -- 2b. AMPERE ──────────────────────────────────────────────────────────
+    print("\n[ 2.2 / 3 ]  Processing 'ampere' …")
+    ampere_maps, ampere_ts = extract_ampere_arrays(results)
+    print(f"  Valid samples : {ampere_maps.shape[0]}")
+
+    print("  Computing correlation …", end="", flush=True)
+    corr_mat  = compute_correlation_matrix(ampere_maps, nan_policy=nan_policy)
+    print(" done.")
+    corr_maps = corr_matrix_to_maps(corr_mat)
+
+    print("  Saving …")
+    saved_paths = save_arrays(
+        output_dir, corr_maps, corr_mat, "ampere", save_matrix=save_matrices
+    )
+    saved_paths_all["ampere"] = saved_paths
+
+    meta_quantities["ampere"] = {
+        "source_key": "ampere",
+        "source_index": None,
+        "n_samples": int(ampere_maps.shape[0]),
+        "n_zero_variance_pixels": int(np.isnan(corr_maps).any(axis=(1, 2)).sum()),
+        "corr_range": [
+            float(np.nanmin(corr_maps)),
+            float(np.nanmax(corr_maps)),
+        ],
+        "saved_files": saved_paths,
+    }
+
+    # -- 2c. Residuals (predicted mean − AMPERE) ─────────────────────────────
+    # Only use timestamps present in both pred_ts and ampere_ts.
+    print("\n[ 2.3 / 3 ]  Computing residuals (predicted mean − AMPERE) …")
+    pred_ts_set   = {ts: i for i, ts in enumerate(pred_ts)}
+    ampere_ts_set = {ts: i for i, ts in enumerate(ampere_ts)}
+    common_ts     = sorted(set(pred_ts_set) & set(ampere_ts_set), key=str)
+
+    if not common_ts:
+        warnings.warn(
+            "No common timestamps between predicted and AMPERE arrays — "
+            "residual correlation map will not be computed.",
+            UserWarning,
+        )
+    else:
+        residual_maps = np.stack(
+            [
+                pred_means[pred_ts_set[ts]] - ampere_maps[ampere_ts_set[ts]]
+                for ts in common_ts
+            ],
+            axis=0,
+        )  # (N_common, 50, 24)
+        skipped = len(pred_ts) - len(common_ts)
+        if skipped:
+            warnings.warn(
+                f"{skipped} predicted timestamp(s) had no matching AMPERE entry "
+                "and were excluded from the residual.",
+                UserWarning,
+            )
+        print(f"  Common samples : {len(common_ts)}")
+
+        print("  Computing correlation …", end="", flush=True)
+        corr_mat  = compute_correlation_matrix(residual_maps, nan_policy=nan_policy)
+        print(" done.")
         corr_maps = corr_matrix_to_maps(corr_mat)
 
         print("  Saving …")
         saved_paths = save_arrays(
-            output_dir, corr_maps, corr_mat, qty, save_matrix=save_matrices
+            output_dir, corr_maps, corr_mat, "residual", save_matrix=save_matrices
         )
-        saved_paths_all[qty] = saved_paths
+        saved_paths_all["residual"] = saved_paths
 
-        meta_quantities[qty] = {
-            "n_samples": N,
+        meta_quantities["residual"] = {
+            "source_key": "predicted[0] - ampere",
+            "source_index": None,
+            "n_samples": len(common_ts),
+            "n_skipped_timestamps": skipped,
             "n_zero_variance_pixels": int(np.isnan(corr_maps).any(axis=(1, 2)).sum()),
             "corr_range": [
                 float(np.nanmin(corr_maps)),
@@ -510,7 +679,7 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     parser.add_argument(
-        "pickle",
+        "--pickle",
         metavar="RESULTS_PICKLE",
         help="Path to the results pickle file.",
     )
