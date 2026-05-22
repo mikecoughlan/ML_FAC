@@ -1,0 +1,225 @@
+9/15/2025
+
+First attempts at getting a mcahine learning model working to predict AMPERE data.
+- First step is to get a basic understanding of the AMPERE data. To that end I'm downloading one month of data from the AMPERE website.
+- To that end I'm downloading the zip file for the "Total Current Data" for the month of March 2015.
+- Downloads data as .dat files. Going to see if pandas can read them directly.
+- Current is stored in MA
+- Have to use tab delimiter to open files properly. file = pd.read_csv('filename.dat', delimiter='\t')
+- Okay nevermind that didn't end up working. Reading the daily files in as their original netCDF files and examining them.
+- Using the netCDF4 library to read in the files.
+- there is a difference between nRec(720) and nObs(1200) dimensions. The paper used an output dimension of 1200 so I'm guessing that's the one I want.
+- I think the 720 refers to data points taken every 2 minutes for a whole day. Thought these were supposed to be 10 minute averaged maps?
+- The 1200 must be the points that are used in the maps (50 (90-40 degrees) x 24 (24 hours) = 1200)
+- Okay this is looking more doable.
+- Looks like maybe these are rolling 10 minute averaged maps? 2 minute cadance on the time stamps but the averaging time on the maps is 10 minutes.
+- Yep confirmed that's how it appears to work. This is good to know. Should be simplier to work with and gives me a lot more data to train on.
+
+9/16/2025
+- I think 'jPar' is the current density variable I want.
+- 'cLat_deg' is co-latitude in AACGM coordinates in degrees.
+- 'mlt_hr' is magnetic local time in hours.
+- okay I can accuratly reproduce the AMPERE maps using the jPar variable, the cLat_deg, and the mlt_hr variables. Good. Resoultion is lower than
+	on AMPERE website but they use smoothing so that makes sense. Code for replication below.
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from netCDF4 import Dataset
+import matplotlib as mpl
+
+# Load the netCDF file
+file_path = 'path_to_your_file.nc'
+cdf = Dataset(file_path)
+# Extract variables
+jPar = cdf.variables['jPar'][:][n,:]  # Replace n with the desired time index
+cLat_deg = cdf.variables['cLat_deg'][:][n,:]
+mlt_hr = cdf.variables['mlt_hr'][:][n,:]
+
+# Create a grid for plotting
+df = pd.DataFrame({'cLat_deg': cLat_deg.flatten(), 'mlt_hr': mlt_hr.flatten(), 'jPar': jPar.flatten()})
+pivot_table = df.pivot_table(index='cLat_deg', columns='mlt_hr', values='jPar')
+
+# Plotting
+fig=plt.figure(figsize=(10, 6))
+ax=fig.add_subplot(111, projection='polar')
+ax.set_theta_zero_location('S')
+
+r,th = np.meshgrid(pivot_table.index, np.linspace(0,2*np.pi,24, endpoint=False))
+scale = mpl.colors.Normalize(vmin=-1.5, vmax=1.5) # Adjust vmin and vmax as needed this is what is default on AMPERE website plots
+cbar = fig.colorbar(ax.pcolormesh(th, r, pivot_table.T, norm=scale, cmap='bwr', shading='auto'), ax=ax)
+cbar.set_label('Field-aligned Current Density (mA/m²)')
+ax.set_yticklabels([])  # Hide radial tick labels
+ax.set_xticks(np.linspace(0, 2 * np.pi, 24, endpoint=False))
+ax.set_xticklabels([f'{int(hr)}' for hr in np.linspace(0, 24, 24, endpoint=False)])
+ax.set_title('Field-aligned Current Density Map', va='bottom')
+plt.show()
+
+- next step is to figure out how to download all the maps and automate this a little bit. For the purposes on ML I can keep the current density data
+	in the 1x1200 format. No need to convert to polar coordinates until plotting results.
+- Utils file contains method of unpacking netCDF files and turning current density data into pivot table format for plotting.
+
+
+9/17/2025
+- Was only able to download the AMPERE data for 2009 and 2010. Taking too long to download the monthly zip files. Will wait to hear from AMPERE people
+	if there is a better way to get the data.
+- Downloaded AMPERE data to external drive. path from home dir : ~/Volumes/TARDIS/ampere_data
+- Have enough AMPERE data to write the pipeline. Still need to grab the OMNI data, put it on the drive, and write that part of the pipeline.
+- Going to start by writing the ResNet model in pytorch and the training module.
+- Adapting previous model and training code from RSD project.
+- Conda environment is fac_modeling_v_0
+- Created a utils.py file to hold useful functions. Currently only has the unpacking_current_density function but will add more as needed.
+- If I'm continuing to use the CRPS as the loss function I'm going to have to adjust a lot of the predicted arrays in the evaluation function
+	of the model_training.py script. Currently set up to be sized (batch_size, 2) but will need to be (batch_size, 1200, 2).
+- Also need to be congnizant of the fact that the output of the model will be (batch_size, 1200) and will need to be unsqueezed
+	to (batch_size, 1200, 1) before being concatenated with the std dev predictions to get the right shape for the CRPS function.
+- Will also need to adjust the evaluation function to calculate metrics for each of the 1200 output points and then average them to get a single metric
+	for the whole map.
+- Will have to be aware of the output of each layer in the ResNet. Will require some testing.
+- Am going to stop going through training and evaluation code line by line until writing the data prep code and testing with toy model is done.
+***ASIDE***
+	- One of the creative challenges I'm going to have is figuring out how to plot both prediction and uncertainty of the 2D data. What if instead of the
+		typical bwr colormap I used a colormap that went from blue to purple to red for the prediction and then adding a shading dimension to indicate uncertainty?
+		- For instance low uncertainty would be dark, or the purest form of the color, and get lighter as we go up the uncertainty scale. This could look like a disapearring
+		effect as uncertainty increases. Would have to be careful with the color scale so that it is still interpretable. This would still show the information
+		of upward vs downward currents with the color even if the uncertainty is high.
+***END ASIDE***
+
+9/18/2025
+- Downloaded the cdf files for the high resoultion OMNI data from CDAweb for the years 2009-present. Put them on the external drive in the folder
+	~/Volumes/TARDIS/AIMFAHR/sw_data/omni/
+- Trying to adapt Victor's old code for unpacking the OMNI data from the CDF files into dataframes. Having issues installing pyhdf.
+- Much progress was made. I'm going to sleep now.
+
+9/19/2025
+- was able to process the omni data using cdflib. Have years 2009-2025 processed and saved as feather file.
+- still adjusting the data prep file.
+- Have to put together a slide or two on CRPS for the group meeting next Friday (9/27/2025).
+
+9/23/2025
+-Got the BK model to run. There are nans getting into the data pipeline somewhere. Need to track that down but I think I know how
+to eliminate them even in I can't find where they're coming from.
+- Model can but shouldn't run on my computer. Even with paired down inputs and only 1.5 years of data it took 72 minutes
+to complete one epoch. Can't run the whole thing here.
+- Meeting at 12:00 today with AIMFAHR group to continue presenting. Meeting at 2 with Hyunju and Gowtam to present BK paper.
+- I get 1.5 hours to fix the nan problem before going over my presentation again so I don't make a fool of myself.
+- Fixed the nan problem. It was only one array causing the issue it seems.
+- Downloading all AMPERE data from 2009-2025. Skipping Feb 2017-Feb 2019 because of data problems as advised by AMPERE PI.
+- Will take a while to download. Putting it on the external drive in ~/Volumes/TARDIS/ampere_data
+- Need to understand the differences between Block 1 and NEXT AMPERE data to present to Hyunju and Gowtam next week.
+- Brainstorm and list ways to improve model (this should be fun :)
+- Also need ot clean up my code a bit. Mostly filepath before sharing
+
+9/24/2025
+- Still working on downloading all of the AMPERE data. Only able to do it 6 months at a time. Going to take a bit at this rate.
+- I think I've found a good computer. Going to try to go with a desktop I can remote into from a lightweight laptop. Might have
+	to buy my own monitors and keyboard/mouse but that's okay.
+
+9/25/2025
+- Starting 2016 of the AMPERE data. Making progress! Well, making progress on teh norther hemisphere data I haven't don't any of
+	the southern hemisphere yet.
+- In the mean time going to read a few papers about how the AMPERE data is processed and formulated to get a better understanding
+	of the differences between the block 1 and NEXT data.
+- Starting with Chartier et al 2025 doi: 10.1029/2025SW004511. Notes below:
+	- The Iridium NEXT data are sampled every 8s, corresponding to ∼60km along track distance or 0.5° inlatitude.
+		The Iridium Block 1 data were sampled no less often than 19.5s, but were commanded to 2.2 ssampling during
+		storms, and late in the Block 1 epoch were set to 8s sampling.
+	- Table one is particularly helpful in understanding the differences in the errors between the two datasets when comparing
+		dB values to SWARM measurments. Block one appears to have overall higher magnitude RMSE and bias values. An issue that
+		gets even worse when making the comparison during active times (SWARM > 250nT)
+
+9/26/2025
+- Finished downloading all of the northern hemisphere AMPERE data from 2009-2025 except for Feb 2017-Feb 2019.
+- Finished data processing of all AMPERE data. Saved as feather file on external drive.
+
+9/29/2025
+- Fixed bug in data prep code. A few files are downloaded from AMPERE but empty. The code was erroring out on these files.
+- Added a check to skip any empty files.
+- Started CRPS presentation for group meeting on Friday. Need to finish it and go over the literature on CRPS to be able to answer questions.
+- Also made some slides on the potential model improvements we can make and my plan of action for the next few months pre-AGU.
+
+9/30/2025
+- Going to start examining any identifiable differences between Block 1 and NEXT data. Using Jupyter notebook for this.
+
+10/2/2025
+- Forgot to remove the fill values which is explaining the ridiculious high values I'm seeing in the averages
+- Seems that some of the 0 MLT values are entered as 24 MLT as well. Will need to make this uniform at 0.
+
+
+
+LMAG
+- Can I use a autoencoder like model arcitecture to predict the FACs?
+- Are there problems with pretraining a decoder? I.e. can I train an autoencoder on the AMPERE data and then remove the decoder and make the full model with that?
+- Would that provide an advantage or would the final model converge to that sort of soultion anyway?
+- Cool plots showing how imbalance can effects model metrics. Email that guy, you tooka  pic of his email address.
+
+AMPERE TALK
+- AU and By correlate to asymmetric bikeland currents as shown in AMPERE data
+- John Coxon suggests using ONLY NEXT data since the two datasets are not necesserily compatable because of the differences in asymmetry
+- Email John Coxon for details
+
+Hello again Notes
+11/7/2025
+- Okay Victor has given me access to his server so I'm able to run some models
+- Things i need to change about the current version of models I have run:
+	- Need to delay the omni data by 10 minutes
+	- If I want to make an accurate replication of the BK model I'll need to adjust how the training/validation/test data is split
+	- Currently doing storm time training, would also need to move it to all time for full replication
+	- Switch to MAE error
+- I think I'm doing somethign wrong with my manipulation of the AMPERE maps. Something jsut seems off about them. The current patterns appear more random than anything
+
+
+11/12/2025
+- Training the basic BK model on all of the NEXT era data has caused it to regress to the mean. Model just outputs mean values irrespective of the input. Not sure how to fix.
+- What's strange is that I'm achieving a better loss on teh training data than the results shown in thw BK paper (0.0733 vs my 0.605). Granted, different data sets but still.
+- Rewriting the way the BK model is structured int eh model class to see if that is affecting the training process somehow (BK_1_3)
+
+
+12/4/25
+- Going to transition to using a substorm and storm list for extracting disturbed times rather than my algorithm for now to see if it makes a significant difference.
+- Substorm lsit os based on lists from the Supermag site.
+- Storm list is based on the list from the NASA CDAWeb site.
+- Code has been adjusted to use these lists but I am going to further adjust it to add different amount of time to the timestamps based on wether it's looking at a storm or substorm.
+- Need to figure out the best way to make sure there aren't any overlaps.
+
+"specific_test_storms":["2013-05","2024-05-11 00:00:00", "2023-05-07 12:00:00", "2023-01-05 12:00:00",
+							"2022-04-15 12:00:00", "2024-04-20 12:00:00", "2024-03-25 12:00:00"],
+
+SOME AGU TAKEAWAYS
+- I think I need to just go for the CRU-Net model and use the BK model directly for comparison. Should be tricky but probably more worth the effort.
+- Should contact Brett at Areospace to talk about magnitude detection problems.
+- would be worth it to make time dependant static plots of resulting FAC values to see how they evolve in time.
+- Certainly worth looking at thresholding results somehow and getting classification metrics. This will be good for opperational model, less useful for science model
+- Also think it's worth it to start thinking seriously about utilizing PRIME as inputs. Will help with uncertainty.
+- Creating a time series out of the AMPERE data and predictions is tricky but if I can find a clever way to do it I think it wil greatly help with the analysis.
+- Top scale ways to look at results:
+	- Integrated Current comparisons
+	- RMSE, MAE, CORR etc.
+	- Thresholding maybe?
+- Smaller scale ways:
+	- Number of small scale structures detected in predictions
+	- Presence of reagion 1 and region 2 currents
+	- Location of currents. This is related but different to their existance at all.
+	- Timing of current appearence (is there a delay?)
+	- This is all going to have to be more manual
+- Wonder if adding a single channel layer will help with the scaling. Not sure how this would work with CRPS as I would imagine I would need a 2 channel output for that.
+- Should give serious consideration to post prediction calibration of the results. This may be one of the best ways to fix the problem with the magnitude of the predictions being so low.
+- Stil need to consider using the imbalanced regression with the CRPS. I think this is doable.
+- Is there any point in ensuring the maps are self consistnet? I.e. enforcing that there is no net charge in teh results. Good way to turn this into a PINN.
+- Time to adjust the inputs as well. Really want to start using PRIME especially since I'm diving into the uncertainty.
+- I really need to get to work.
+- Need to standardize everything in the manner of picking the appropriate test storms. Need to discuss adding GANNON storm to test suite with Hyunju and Gowtam.
+	Tricky because having it in teh training data would be ideal but it's so intereting.
+
+
+Create NSF account for porposals. Check my inspires account too. CUA association
+
+Proposal to write (B5):
+- ML AIM dashboard.
+- Real time models with up to date metrics and comparison.
+- Step 1 due 1/26/2026
+- Full proposal due 4/27/2026
+
+Proposal (CAIG):
+- AI testbed for multiple models
+-

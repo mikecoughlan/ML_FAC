@@ -1,0 +1,62 @@
+{
+	"model": "FAC",
+	"version": "ACORN_1_0",
+	"eras": "next",
+	"ampere_version": "0_1",
+	"data_version": "op_0_0",
+	"random_seed": 42,
+	"input_params": ["Vx","BX_GSE","BY_GSM","BZ_GSM","proton_density","sin_month","cos_month",
+						"F107","SML", "SMU", "SYM_H", "ASY_H","SME"],
+	"opp_input_params": ["Vx","BX_GSE","BY_GSM","BZ_GSM","proton_density","sin_month","cos_month",
+						"F107"],
+	"ampere_delay":0,
+
+	"shuffling_split_data":true,
+	"extract_storms":false,
+	"use_disturbed_time_list":false,
+	"length":240,
+	"patience":120,
+	"lead":1440,
+	"recovery":2880,
+	"substorm_lead":240,
+	"substorm_recovery":360,
+	"storm_lead":1440,
+	"storm_recovery":2880,
+	"storm_extract_param" :"SME",
+	"storm_extract_limit" :600,
+
+	"specific_test_storms":["2023-01-04 09:00:00", "2023-05-06 05:00:00"],
+	"time_history":60,
+	"filters":128,
+	"learning_rate":1e-6,
+	"epochs":500,
+	"loss":"mse",
+	"early_stop_patience":25,
+	"batch_size":64,
+
+	"ampere_path": "~/Volumes/TARDIS/AIMFAHR/ampere_data/",
+	"omni_path": "~/Volumes/TARDIS/AIMFAHR/omni_data/",
+	"prepared_data_path": "~/Volumes/TARDIS/AIMFAHR/prepared_data/",
+
+	"model_dir": "models/",
+	"plot_dir": "plots/",
+	"results_dir": "results/",
+	"outputs_dir":"outputs/",
+
+	"model_config": {
+                "in_channels":1,
+                "out_channels":2,
+                "base_channels":64,
+                "depth":2,
+                "num_res_blocks":3,
+                "layers_per_block":3,
+                "channel_mult":2.0,
+                "cbam_reduction":8,
+                "dropout_rate":0.3,
+                "dropout_depth":0,
+                "debug":false,
+                "use_cbam":true,
+                "use_attention_gates":true
+	}
+
+}

@@ -222,6 +222,6 @@ plots/
 models/
 outputs/
 shap/
-testing_notebook.ipynb
+*.ipynb
 *.png
 *.mp4
