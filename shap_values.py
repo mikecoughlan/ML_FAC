@@ -42,7 +42,7 @@ model_file = f'{CONFIG["model_dir"]}{CONFIG["model"]}_{CONFIG["version"]}_{CONFI
 # equatorward edge (index 49, MLAT_MIN).  Index 0 = pole is consistent with
 # origin='upper' / colatitude-at-top used in all spatial plots in this project.
 # Adjust MLAT_MIN / MLAT_MAX if your grid covers a different range.
-MLAT_MIN = 50.0   # degrees MLAT at the equatorward edge (index N_MLAT - 1)
+MLAT_MIN = 40.0   # degrees MLAT at the equatorward edge (index N_MLAT - 1)
 MLAT_MAX = 90.0   # degrees MLAT at the pole             (index 0)
 N_MLAT   = 50
 N_MLT    = 24
@@ -60,9 +60,18 @@ N_MLT    = 24
 # Add, remove, or reorder entries freely — the loop in main() processes each
 # one independently and saves a separate pickle + region plot per entry.
 REGIONS = [
-	{'mlat_low': 60.0, 'mlat_high': 75.0, 'mlt_start':  6, 'mlt_end': 17},   # dayside auroral
-	{'mlat_low': 60.0, 'mlat_high': 75.0, 'mlt_start': 22, 'mlt_end':  2},   # nightside, wraps midnight
-	{'mlat_low': 75.0, 'mlat_high': 90.0, 'mlt_start':  0, 'mlt_end': 23},   # polar cap, full circle
+	{'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start':  9, 'mlt_end': 14},   # dayside auroral
+	{'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start':  15, 'mlt_end': 20},   # dusk auroral
+	{'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start':  21, 'mlt_end': 2},   # nightside auroral
+	{'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start':  3, 'mlt_end': 8},   # dawn auroral
+	{'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start':  9, 'mlt_end': 14},   # dayside region 1
+	{'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start':  15, 'mlt_end': 20},   # dusk region 1
+	{'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start':  21, 'mlt_end': 2},   # nightside region 1
+	{'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start':  3, 'mlt_end': 8},   # dawn region 1
+	{'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  9, 'mlt_end': 14},   # dayside region 2
+	{'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  15, 'mlt_end': 20},   # dusk region 2
+	{'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  21, 'mlt_end': 2},   # nightside region 2
+	{'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  3, 'mlt_end': 8},   # dawn region 2
 ]
 
 
@@ -561,8 +570,8 @@ def get_shap_values(model, model_name, training_data, testing_data,
 		background_gpu = background_cpu.to(DEVICE)
 		del background_cpu
 		gc.collect()
-
-		explainer = shap.GradientExplainer(model=effective_model, data=background_gpu)
+		with torch.no_grad():
+			explainer = shap.GradientExplainer(model=effective_model, data=background_gpu)
 
 		del background_gpu
 		_free_gpu()
@@ -821,7 +830,7 @@ def main():
 			training_data=train_x,
 			testing_data=test_x,
 			background_examples=1000,
-			delimiter=1,
+			delimiter=64,
 			explainer_type=EXPLAINER_TYPE,
 			mlat_indices=mlat_indices,
 			mlt_indices=mlt_indices,

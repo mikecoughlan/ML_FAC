@@ -50,7 +50,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
 
 # Loading CONFIG json file
-with open('config.json', 'r') as f:
+with open('sci_config.json', 'r') as f:
 	CONFIG = json.load(f)
 
 
@@ -69,7 +69,7 @@ class PreparingData():
 		# ---------------------------------------------------------------------
 		# 1. Load configuration from external JSON file
 		# ---------------------------------------------------------------------
-		with open('config.json', 'r') as f:
+		with open('sci_config.json', 'r') as f:
 			# self.config is a dictionary containing general parameters such as:
 			# 'version', 'input_params', 'ampere_version', 'data_version', etc.
 			self.config = json.load(f)

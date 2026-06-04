@@ -7,7 +7,7 @@
 	"random_seed": 42,
 	"input_params": ["Vx","BX_GSE","BY_GSM","BZ_GSM","proton_density","sin_month","cos_month",
 						"F107","SML", "SMU", "SYM_H", "ASY_H","SME"],
-	"bk_input_params": ["Bz", "By", "Bx", "Vx", "Np", "month_sine", "month_cosine", "F107",
+	"opp_input_params": ["Bz", "By", "Bx", "Vx", "Np", "month_sine", "month_cosine", "F107",
 							"SML", "SMU", "SYM_H", "ASY_H","SME"],
 	"ampere_delay":0,
 
