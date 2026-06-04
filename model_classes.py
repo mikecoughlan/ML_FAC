@@ -344,7 +344,7 @@ class DecoderBlock(nn.Module):
         use_attention_gates: bool  = True,
         dropout_rate:        float = 0.0,
         cbam_reduction:      int   = 16,
-        kernel_size:         int   = 2,
+        kernel_size:         int   = 3,
     ):
         super().__init__()
         self.attention_gate = (

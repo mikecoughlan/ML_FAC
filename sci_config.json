@@ -7,7 +7,7 @@
 	"random_seed": 42,
 	"input_params": ["Vx","BX_GSE","BY_GSM","BZ_GSM","proton_density","sin_month","cos_month",
 						"F107","SML", "SMU", "SYM_H", "ASY_H","SME"],
-	"bk_input_params": ["Bx", "By", "Bz", "Vx", "Np", "month_sine", "month_cosine", "F107",
+	"bk_input_params": ["Bz", "By", "Bx", "Vx", "Np", "month_sine", "month_cosine", "F107",
 							"SML", "SMU", "SYM_H", "ASY_H","SME"],
 	"ampere_delay":0,
 
@@ -54,8 +54,6 @@
                 "cbam_reduction":8,
                 "dropout_rate":0.3,
                 "dropout_depth":0,
-				"enc_kernel_size":3,
-        		"dec_kernel_size":3,
                 "debug":false,
                 "use_cbam":true,
                 "use_attention_gates":true
