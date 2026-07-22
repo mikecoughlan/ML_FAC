@@ -1,49 +1,29 @@
-import argparse
 # Importing the libraries
-import datetime
-import gc
-import glob
-import json
-import math
-import os
-import pickle
-import subprocess
-import time
 
-import matplotlib
-import matplotlib.animation as animation
-import matplotlib.image as mpimg
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
+
 # import torchvision
 # import torchvision.transforms as transforms
-import tqdm
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-# from spacepy import pycdf
-from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-import utils
+# from spacepy import pycdf
+
 
 # from torchsummary import summary
 # from torchvision.models.feature_extraction import (create_feature_extractor,
-                                                #    get_graph_node_names)
+#    get_graph_node_names)
 
 pd.options.mode.chained_assignment = None
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Device: {DEVICE}')
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}")
 
 
 class CRPS(nn.Module):
-    '''
+    """
     Defining the CRPS loss function for model training.
-    '''
+    """
 
     def __init__(self):
         super(CRPS, self).__init__()
@@ -72,10 +52,21 @@ class CRPS(nn.Module):
 
     def calculate_crps(self, epsilon, sig):
 
-        crps = torch.mul(sig, (torch.add(torch.mul(torch.div(epsilon, sig), torch.erf(torch.div(epsilon, torch.mul(np.sqrt(2), sig)))), \
-								torch.sub(torch.mul(torch.sqrt(torch.div(2, np.pi)), torch.exp(torch.div(torch.mul(-1, torch.pow(epsilon, 2)), \
-								(torch.mul(2, torch.pow(sig, 2)))))), torch.div(1, torch.sqrt(torch.tensor(np.pi)))))))
-
+        crps = torch.mul(
+            sig,
+            (
+                torch.add(
+                    torch.mul(torch.div(epsilon, sig), torch.erf(torch.div(epsilon, torch.mul(np.sqrt(2), sig)))),
+                    torch.sub(
+                        torch.mul(
+                            torch.sqrt(torch.div(2, np.pi)),
+                            torch.exp(torch.div(torch.mul(-1, torch.pow(epsilon, 2)), (torch.mul(2, torch.pow(sig, 2))))),
+                        ),
+                        torch.div(1, torch.sqrt(torch.tensor(np.pi))),
+                    ),
+                )
+            ),
+        )
 
         return crps
 
@@ -85,18 +76,18 @@ def create_bin_weights(y_train, num_bins=50, range_min=None, range_max=None):
     Create weights based on the inverse frequency of samples in bins.
     """
     # Histogram of values
-    if range_min == None:
+    if range_min is None:
         range_min = min(np.abs(y_train.flatten()))
-    if range_max == None:
+    if range_max is None:
         range_max = max(np.abs(y_train.flatten()))
     hist, bin_edges = np.histogram(np.abs(y_train), bins=num_bins, range=(range_min, range_max), density=False)
-    hist = hist/np.sum(hist)
+    hist = hist / np.sum(hist)
 
     if not isinstance(num_bins, int):
-        num_bins=len(num_bins)-1
+        num_bins = len(num_bins) - 1
 
     bin_width = (bin_edges[-1] - bin_edges[0]) / num_bins
-    print(f'Hist results: {hist}')
+    print(f"Hist results: {hist}")
     # def get_weight(value):
     #     bin_idx = int((value - bin_edges[0]) / bin_width)
     #     bin_idx = min(bin_idx, num_bins - 1)
@@ -107,8 +98,8 @@ def create_bin_weights(y_train, num_bins=50, range_min=None, range_max=None):
     #     return 1/hist[bin_idx]
 
     # weights = np.array([get_weight(val) for val in hist])
-    inverse_weights = pd.Series(np.where(hist==0, np.nan, hist)).interpolate(method='linear').to_numpy()
-    weights = 1/inverse_weights
+    inverse_weights = pd.Series(np.where(hist == 0, np.nan, hist)).interpolate(method="linear").to_numpy()
+    weights = 1 / inverse_weights
 
     # print(f'y_train shape: {y_train.shape}')
     # print(f'weights shape: {weights.shape}')
@@ -126,18 +117,13 @@ class WeightedCRPS(nn.Module):
     This loss gives higher importance to rare samples
     while maintaining reasonable performance for common samples.
     """
+
     def __init__(self, bin_edges, bin_weights):
         super(WeightedCRPS, self).__init__()
 
         # Store bin info as buffers so they move with .to(device)
-        self.register_buffer(
-            "bin_edges",
-            torch.tensor(bin_edges[:-1], dtype=torch.float32)
-        )
-        self.register_buffer(
-            "bin_weights",
-            torch.tensor(bin_weights, dtype=torch.float32)
-        )
+        self.register_buffer("bin_edges", torch.tensor(bin_edges[:-1], dtype=torch.float32))
+        self.register_buffer("bin_weights", torch.tensor(bin_weights, dtype=torch.float32))
 
         self.num_bins = len(bin_weights)
         self.range_min = bin_edges[0]
@@ -152,11 +138,22 @@ class WeightedCRPS(nn.Module):
 
     def calculate_crps(self, epsilon, sig):
 
-        sig = torch.add(sig,1e-6)
-        crps = torch.mul(sig, (torch.add(torch.mul(torch.div(epsilon, sig), torch.erf(torch.div(epsilon, torch.mul(np.sqrt(2), sig)))), \
-								torch.sub(torch.mul(torch.sqrt(torch.div(2, np.pi)), torch.exp(torch.div(torch.mul(-1, torch.pow(epsilon, 2)), \
-								(torch.mul(2, torch.pow(sig, 2)))))), torch.div(1, torch.sqrt(torch.tensor(np.pi)))))))
-
+        sig = torch.add(sig, 1e-6)
+        crps = torch.mul(
+            sig,
+            (
+                torch.add(
+                    torch.mul(torch.div(epsilon, sig), torch.erf(torch.div(epsilon, torch.mul(np.sqrt(2), sig)))),
+                    torch.sub(
+                        torch.mul(
+                            torch.sqrt(torch.div(2, np.pi)),
+                            torch.exp(torch.div(torch.mul(-1, torch.pow(epsilon, 2)), (torch.mul(2, torch.pow(sig, 2))))),
+                        ),
+                        torch.div(1, torch.sqrt(torch.tensor(np.pi))),
+                    ),
+                )
+            ),
+        )
 
         return crps
 
@@ -167,13 +164,13 @@ class WeightedCRPS(nn.Module):
             y_pred (Tensor): predicted values
         """
         # splitting the y_pred tensor into mean and std
-        if len(y_pred.shape)==3:
-            mean, std = torch.unbind(y_pred, dim=2) # for linear model output
-        elif len(y_pred.shape)==4:
-            mean, std = torch.unbind(y_pred, dim=1) # for 2d conv model output
+        if len(y_pred.shape) == 3:
+            mean, std = torch.unbind(y_pred, dim=2)  # for linear model output
+        elif len(y_pred.shape) == 4:
+            mean, std = torch.unbind(y_pred, dim=1)  # for 2d conv model output
         else:
-            print(f'y_pred shape: {y_pred.shape}')
-            raise ValueError('Output is of an incorrect dimension. Check.')
+            print(f"y_pred shape: {y_pred.shape}")
+            raise ValueError("Output is of an incorrect dimension. Check.")
         # making the arrays the right dimensions
         mean = mean.unsqueeze(-1)
         std = std.unsqueeze(-1)
@@ -205,18 +202,13 @@ class WeightedMeanSquaredError(nn.Module):
     This loss gives higher importance to rare samples
     while maintaining reasonable performance for common samples.
     """
+
     def __init__(self, bin_edges, bin_weights):
         super(WeightedMeanSquaredError, self).__init__()
 
         # Store bin info as buffers so they move with .to(device)
-        self.register_buffer(
-            "bin_edges",
-            torch.tensor(bin_edges[:-1], dtype=torch.float32)
-        )
-        self.register_buffer(
-            "bin_weights",
-            torch.tensor(bin_weights, dtype=torch.float32)
-        )
+        self.register_buffer("bin_edges", torch.tensor(bin_edges[:-1], dtype=torch.float32))
+        self.register_buffer("bin_weights", torch.tensor(bin_weights, dtype=torch.float32))
 
         self.num_bins = len(bin_weights)
         self.range_min = bin_edges[0]
@@ -232,7 +224,7 @@ class WeightedMeanSquaredError(nn.Module):
         y_true = y_true.unsqueeze(-1)
         y_pred = y_pred.unsqueeze(-1)
 
-		# flattening the tensors
+        # flattening the tensors
         y_true = y_true.view(-1)
         y_pred = y_pred.view(-1)
 
@@ -264,11 +256,10 @@ class WeightedMeanSquaredError(nn.Module):
 
         # Weighted MSE
         # calculating the error
-        mean_squared = torch.pow(torch.sub(y_pred,y_true),2)
-        weighted_errors = torch.mul(weights,mean_squared)
+        mean_squared = torch.pow(torch.sub(y_pred, y_true), 2)
+        weighted_errors = torch.mul(weights, mean_squared)
         # print(f'mean squared: {mean_squared}')
         # print(f'weighted_errors: {weighted_errors}')
         # raise
 
         return torch.mean(weighted_errors)
-

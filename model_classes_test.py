@@ -1,128 +1,107 @@
-import argparse
 # Importing the libraries
-import datetime
-import gc
-import glob
-import json
-import math
-import os
-import pickle
-import subprocess
-import time
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
-import matplotlib
-import matplotlib.animation as animation
-import matplotlib.image as mpimg
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+
 # import torchvision.transforms as transforms
 # import torchvision
 # import torchvision.transforms as transforms
-import tqdm
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 # from torchsummary import summary
 # from torchvision.models.feature_extraction import (create_feature_extractor,
 #                                                    get_graph_node_names)
-import utils
 
 
 class BK_model(nn.Module):
-	def __init__(self, input_size, output_size, num_channels, num_residual_blocks, crps=False):
-		super(BK_model, self).__init__()
-		self.input_size = input_size
-		self.output_size = output_size
-		self.num_channels = num_channels
-		self.num_residual_blocks = num_residual_blocks
-		self.num_nodes = (128)*32
-		self.dropout = 0.2
-		self.crps = crps
+    def __init__(self, input_size, output_size, num_channels, num_residual_blocks, crps=False):
+        super(BK_model, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.num_channels = num_channels
+        self.num_residual_blocks = num_residual_blocks
+        self.num_nodes = (128) * 32
+        self.dropout = 0.2
+        self.crps = crps
 
-		# Initial convolution layer
-		self.conv1 = nn.Conv2d(in_channels=1, out_channels=num_channels, kernel_size=3, padding=1)
-		self.bn1 = nn.BatchNorm2d(num_channels)
+        # Initial convolution layer
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=num_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_channels)
 
-		# Residual blocks
-		self.residual_block_1 = nn.Sequential(
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels),
-				nn.ReLU(),
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels),
-				nn.ReLU(),
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels)
-			)
-		self.residual_block_2 = nn.Sequential(
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels),
-				nn.ReLU(),
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels),
-				nn.ReLU(),
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels)
-			)
-		self.residual_block_3 = nn.Sequential(
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels),
-				nn.ReLU(),
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels),
-				nn.ReLU(),
-				nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
-				nn.BatchNorm2d(num_channels)
-			)
+        # Residual blocks
+        self.residual_block_1 = nn.Sequential(
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+        )
+        self.residual_block_2 = nn.Sequential(
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+        )
+        self.residual_block_3 = nn.Sequential(
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+            nn.ReLU(),
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(num_channels),
+        )
 
-		# Calculate the size after the convolutional layers to define the first fully connected layer
-		residual_output_size = (num_channels, input_size[0], input_size[1])  # Assuming padding keeps the spatial dimensions the same
+        # Calculate the size after the convolutional layers to define the first fully connected layer
+        residual_output_size = (num_channels, input_size[0], input_size[1])  # Assuming padding keeps the spatial dimensions the same
 
-		# Final layers
-		self.linear_block = nn.Sequential(
-				nn.Linear(residual_output_size[0]*residual_output_size[1]*residual_output_size[2], output_size[0]),
-				nn.ReLU(),
-				nn.Dropout(self.dropout),
-				nn.Linear(output_size[0], output_size[0])
-			)
-	def forward(self, x):
-		x = F.relu(self.bn1(self.conv1(x)))
+        # Final layers
+        self.linear_block = nn.Sequential(
+            nn.Linear(residual_output_size[0] * residual_output_size[1] * residual_output_size[2], output_size[0]),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(output_size[0], output_size[0]),
+        )
 
-		# for ___ in range(self.num_residual_blocks):
-		# 	residual = x
-		# 	x = self.residual_block(x)
-		# 	x += residual
-		# 	x = F.relu(x)
-		residual = x
-		x = self.residual_block_1(x)
-		x = x + residual
-		x = F.relu(x)
+    def forward(self, x):
+        x = F.relu(self.bn1(self.conv1(x)))
 
-		residual = x
-		x = self.residual_block_2(x)
-		x = x + residual
-		x = F.relu(x)
+        # for ___ in range(self.num_residual_blocks):
+        # 	residual = x
+        # 	x = self.residual_block(x)
+        # 	x += residual
+        # 	x = F.relu(x)
+        residual = x
+        x = self.residual_block_1(x)
+        x = x + residual
+        x = F.relu(x)
 
-		residual = x
-		x = self.residual_block_2(x)
-		x = x + residual
-		x = F.relu(x)
+        residual = x
+        x = self.residual_block_2(x)
+        x = x + residual
+        x = F.relu(x)
 
-		x = x.view(x.size(0), -1)
-		x = self.linear_block(x)
+        residual = x
+        x = self.residual_block_2(x)
+        x = x + residual
+        x = F.relu(x)
 
-		if self.crps:
-			x = x.view(x.shape[0], int(x.shape[1]/2), 2)
-		# x = x.view(x.size(0), self.output_size[0], self.output_size[1], self.output_size[2])
-		return x
+        x = x.view(x.size(0), -1)
+        x = self.linear_block(x)
+
+        if self.crps:
+            x = x.view(x.shape[0], int(x.shape[1] / 2), 2)
+        # x = x.view(x.size(0), self.output_size[0], self.output_size[1], self.output_size[2])
+        return x
 
 
 """
@@ -143,6 +122,7 @@ Architecture
 # Attention modules
 # ---------------------------------------------------------------------------
 
+
 class ChannelAttention(nn.Module):
     """Squeeze-and-excitation style channel attention (half of CBAM)."""
 
@@ -161,7 +141,7 @@ class ChannelAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         avg = self.mlp(self.avg_pool(x))
-        mx  = self.mlp(self.max_pool(x))
+        mx = self.mlp(self.max_pool(x))
         scale = self.sigmoid(avg + mx).unsqueeze(-1).unsqueeze(-1)
         return x * scale
 
@@ -172,8 +152,7 @@ class SpatialAttention(nn.Module):
     def __init__(self, kernel_size: int = 7):
         super().__init__()
         pad = kernel_size // 2
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size,
-                              padding=pad, bias=False)
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=pad, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -225,8 +204,7 @@ class AttentionGate(nn.Module):
 
     def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         # Upsample g to match x's spatial size if needed
-        g_up = F.interpolate(g, size=x.shape[2:],
-                             mode="bilinear", align_corners=False)
+        g_up = F.interpolate(g, size=x.shape[2:], mode="bilinear", align_corners=False)
         alpha = self.psi(self.relu(self.W_x(x) + self.W_g(g_up)))
         return x * alpha
 
@@ -234,6 +212,7 @@ class AttentionGate(nn.Module):
 # ---------------------------------------------------------------------------
 # Core residual block
 # ---------------------------------------------------------------------------
+
 
 def _conv_pad(in_channels: int, out_channels: int, kernel_size: int) -> nn.Module:
     """
@@ -249,19 +228,13 @@ def _conv_pad(in_channels: int, out_channels: int, kernel_size: int) -> nn.Modul
     """
     if kernel_size % 2 == 1:
         # Odd — symmetric padding is exact
-        return nn.Conv2d(in_channels, out_channels,
-                         kernel_size=kernel_size,
-                         padding=kernel_size // 2,
-                         bias=False)
+        return nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
     else:
         # Even — asymmetric: pad more on left/top, less on right/bottom
         p = kernel_size // 2
         return nn.Sequential(
-            nn.ZeroPad2d((p, p - 1, p, p - 1)),   # (left, right, top, bottom)
-            nn.Conv2d(in_channels, out_channels,
-                      kernel_size=kernel_size,
-                      padding=0,
-                      bias=False),
+            nn.ZeroPad2d((p, p - 1, p, p - 1)),  # (left, right, top, bottom)
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=0, bias=False),
         )
 
 
@@ -279,13 +252,13 @@ class ResidualBlock(nn.Module):
 
     def __init__(
         self,
-        in_channels:    int,
-        out_channels:   int,
-        num_layers:     int   = 2,
-        use_cbam:       bool  = True,
-        dropout_rate:   float = 0.0,
-        cbam_reduction: int   = 16,
-        kernel_size:    int   = 3,
+        in_channels: int,
+        out_channels: int,
+        num_layers: int = 2,
+        use_cbam: bool = True,
+        dropout_rate: float = 0.0,
+        cbam_reduction: int = 16,
+        kernel_size: int = 3,
     ):
         super().__init__()
         layers: List[nn.Module] = []
@@ -298,7 +271,7 @@ class ResidualBlock(nn.Module):
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
             ]
-        layers = layers[:-1]   # drop final ReLU; applied after residual add
+        layers = layers[:-1]  # drop final ReLU; applied after residual add
         self.block = nn.Sequential(*layers)
 
         self.skip = (
@@ -306,7 +279,8 @@ class ResidualBlock(nn.Module):
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
                 nn.BatchNorm2d(out_channels),
             )
-            if in_channels != out_channels else nn.Identity()
+            if in_channels != out_channels
+            else nn.Identity()
         )
         self.relu = nn.ReLU(inplace=True)
         self.cbam = CBAM(out_channels, cbam_reduction) if use_cbam else None
@@ -322,6 +296,7 @@ class ResidualBlock(nn.Module):
 # Encoder / Decoder blocks
 # ---------------------------------------------------------------------------
 
+
 class EncoderBlock(nn.Module):
     """
     num_res_blocks ResidualBlocks → MaxPool2d(2).
@@ -330,25 +305,19 @@ class EncoderBlock(nn.Module):
 
     def __init__(
         self,
-        in_channels:    int,
-        out_channels:   int,
-        num_res_blocks: int   = 1,
+        in_channels: int,
+        out_channels: int,
+        num_res_blocks: int = 1,
         layers_per_block: int = 2,
-        use_cbam:       bool  = True,
-        dropout_rate:   float = 0.0,
-        cbam_reduction: int   = 16,
-        kernel_size:    int   = 3,
+        use_cbam: bool = True,
+        dropout_rate: float = 0.0,
+        cbam_reduction: int = 16,
+        kernel_size: int = 3,
     ):
         super().__init__()
-        blocks: List[nn.Module] = [
-            ResidualBlock(in_channels, out_channels, layers_per_block,
-                          use_cbam, dropout_rate, cbam_reduction, kernel_size)
-        ]
+        blocks: List[nn.Module] = [ResidualBlock(in_channels, out_channels, layers_per_block, use_cbam, dropout_rate, cbam_reduction, kernel_size)]
         for _ in range(num_res_blocks - 1):
-            blocks.append(
-                ResidualBlock(out_channels, out_channels, layers_per_block,
-                              use_cbam, dropout_rate, cbam_reduction, kernel_size)
-            )
+            blocks.append(ResidualBlock(out_channels, out_channels, layers_per_block, use_cbam, dropout_rate, cbam_reduction, kernel_size))
         self.res_blocks = nn.Sequential(*blocks)
         self.pool = nn.MaxPool2d(2)
 
@@ -365,45 +334,36 @@ class DecoderBlock(nn.Module):
 
     def __init__(
         self,
-        in_channels:         int,
-        skip_channels:       int,
-        out_channels:        int,
-        num_res_blocks:      int   = 1,
-        layers_per_block:    int   = 2,
-        use_cbam:            bool  = True,
-        use_attention_gates: bool  = True,
-        dropout_rate:        float = 0.0,
-        cbam_reduction:      int   = 16,
-        kernel_size:         int   = 2,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        num_res_blocks: int = 1,
+        layers_per_block: int = 2,
+        use_cbam: bool = True,
+        use_attention_gates: bool = True,
+        dropout_rate: float = 0.0,
+        cbam_reduction: int = 16,
+        kernel_size: int = 2,
     ):
         super().__init__()
-        self.attention_gate = (
-            AttentionGate(skip_channels, in_channels)
-            if use_attention_gates else None
-        )
+        self.attention_gate = AttentionGate(skip_channels, in_channels) if use_attention_gates else None
         merged = in_channels + skip_channels
-        blocks: List[nn.Module] = [
-            ResidualBlock(merged, out_channels, layers_per_block,
-                          use_cbam, dropout_rate, cbam_reduction, kernel_size)
-        ]
+        blocks: List[nn.Module] = [ResidualBlock(merged, out_channels, layers_per_block, use_cbam, dropout_rate, cbam_reduction, kernel_size)]
         for _ in range(num_res_blocks - 1):
-            blocks.append(
-                ResidualBlock(out_channels, out_channels, layers_per_block,
-                              use_cbam, dropout_rate, cbam_reduction, kernel_size)
-            )
+            blocks.append(ResidualBlock(out_channels, out_channels, layers_per_block, use_cbam, dropout_rate, cbam_reduction, kernel_size))
         self.res_blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         if self.attention_gate is not None:
             skip = self.attention_gate(skip, x)
-        x = F.interpolate(x, size=skip.shape[2:],
-                          mode="bilinear", align_corners=False)
+        x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
         return self.res_blocks(torch.cat([x, skip], dim=1))
 
 
 # ---------------------------------------------------------------------------
 # ACORN-Net
 # ---------------------------------------------------------------------------
+
 
 class ACORN(nn.Module):
     """
@@ -433,23 +393,23 @@ class ACORN(nn.Module):
 
     def __init__(
         self,
-        in_channels:          int                       = 1,
-        out_channels:         int                       = 1,
-        base_channels:        int                       = 64,
-        depth:                int                       = 4,
-        num_res_blocks:       int                       = 1,
-        layers_per_block:     int                       = 2,
-        channel_mult:         float                     = 2.0,
-        cbam_reduction:       int                       = 16,
-        use_cbam:             bool                      = True,
-        use_attention_gates:  bool                      = True,
-        dropout_rate:         float                     = 0.0,
-        dropout_depth:        int                       = 0,
-        enc_kernel_size:      int                       = 3,
-        dec_kernel_size:      int                       = 3,
-        output_size:          Optional[Tuple[int, int]] = None,
-        input_size:           Optional[Tuple[int, int]] = None,
-        debug:                bool                      = True,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        base_channels: int = 64,
+        depth: int = 4,
+        num_res_blocks: int = 1,
+        layers_per_block: int = 2,
+        channel_mult: float = 2.0,
+        cbam_reduction: int = 16,
+        use_cbam: bool = True,
+        use_attention_gates: bool = True,
+        dropout_rate: float = 0.0,
+        dropout_depth: int = 0,
+        enc_kernel_size: int = 3,
+        dec_kernel_size: int = 3,
+        output_size: Optional[Tuple[int, int]] = None,
+        input_size: Optional[Tuple[int, int]] = None,
+        debug: bool = True,
     ):
         super().__init__()
 
@@ -467,37 +427,29 @@ class ACORN(nn.Module):
         if not (0.0 <= dropout_rate < 1.0):
             raise ValueError(f"dropout_rate={dropout_rate} must be in [0, 1).")
         if dropout_depth < 0 or dropout_depth > depth:
-            raise ValueError(
-                f"dropout_depth={dropout_depth} must be in [0, depth={depth}]."
-            )
+            raise ValueError(f"dropout_depth={dropout_depth} must be in [0, depth={depth}].")
         if enc_kernel_size < 1:
             raise ValueError(f"enc_kernel_size={enc_kernel_size} must be >= 1.")
         if dec_kernel_size < 1:
             raise ValueError(f"dec_kernel_size={dec_kernel_size} must be >= 1.")
 
-        self.output_size         = output_size
-        self.depth               = depth
-        self.use_cbam            = use_cbam
+        self.output_size = output_size
+        self.depth = depth
+        self.use_cbam = use_cbam
         self.use_attention_gates = use_attention_gates
-        self.enc_kernel_size     = enc_kernel_size
-        self.dec_kernel_size     = dec_kernel_size
+        self.enc_kernel_size = enc_kernel_size
+        self.dec_kernel_size = dec_kernel_size
 
         # ── Channel progression ──────────────────────────────────────────────
-        enc_channels: List[int] = [
-            max(1, round(base_channels * (channel_mult ** i)))
-            for i in range(depth)
-        ]
+        enc_channels: List[int] = [max(1, round(base_channels * (channel_mult**i))) for i in range(depth)]
         bot_channels: int = max(1, round(enc_channels[-1] * channel_mult))
 
         # ── Spatial size check ───────────────────────────────────────────────
-        self._min_spatial = 2 ** depth
+        self._min_spatial = 2**depth
         if input_size is not None:
             h, w = input_size
             if h < self._min_spatial or w < self._min_spatial:
-                raise ValueError(
-                    f"input_size=({h}, {w}) too small for depth={depth}. "
-                    f"Both H and W must be >= 2^depth = {self._min_spatial}."
-                )
+                raise ValueError(f"input_size=({h}, {w}) too small for depth={depth}. Both H and W must be >= 2^depth = {self._min_spatial}.")
 
         # Helper: should level lvl (0=shallowest) receive dropout?
         def _do(lvl: int) -> float:
@@ -505,8 +457,7 @@ class ACORN(nn.Module):
 
         # ── Stem ─────────────────────────────────────────────────────────────
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, enc_channels[0],
-                      kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, enc_channels[0], kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(enc_channels[0]),
             nn.ReLU(inplace=True),
         )
@@ -514,29 +465,35 @@ class ACORN(nn.Module):
         # ── Encoder ──────────────────────────────────────────────────────────
         self.encoders = nn.ModuleList()
         for i in range(depth):
-            ch_in  = enc_channels[i - 1] if i > 0 else enc_channels[0]
+            ch_in = enc_channels[i - 1] if i > 0 else enc_channels[0]
             ch_out = enc_channels[i]
-            self.encoders.append(EncoderBlock(
-                ch_in, ch_out,
-                num_res_blocks   = num_res_blocks,
-                layers_per_block = layers_per_block,
-                use_cbam         = use_cbam,
-                dropout_rate     = _do(i),
-                cbam_reduction   = cbam_reduction,
-                kernel_size      = enc_kernel_size,
-            ))
+            self.encoders.append(
+                EncoderBlock(
+                    ch_in,
+                    ch_out,
+                    num_res_blocks=num_res_blocks,
+                    layers_per_block=layers_per_block,
+                    use_cbam=use_cbam,
+                    dropout_rate=_do(i),
+                    cbam_reduction=cbam_reduction,
+                    kernel_size=enc_kernel_size,
+                )
+            )
 
         # ── Bottleneck ───────────────────────────────────────────────────────
         self.bottleneck = nn.Sequential(
-            *[ResidualBlock(
-                enc_channels[-1] if j == 0 else bot_channels,
-                bot_channels,
-                num_layers     = layers_per_block,
-                use_cbam       = use_cbam,
-                dropout_rate   = dropout_rate,
-                cbam_reduction = cbam_reduction,
-                kernel_size    = enc_kernel_size,
-              ) for j in range(num_res_blocks)]
+            *[
+                ResidualBlock(
+                    enc_channels[-1] if j == 0 else bot_channels,
+                    bot_channels,
+                    num_layers=layers_per_block,
+                    use_cbam=use_cbam,
+                    dropout_rate=dropout_rate,
+                    cbam_reduction=cbam_reduction,
+                    kernel_size=enc_kernel_size,
+                )
+                for j in range(num_res_blocks)
+            ]
         )
 
         # ── Decoder ──────────────────────────────────────────────────────────
@@ -545,16 +502,20 @@ class ACORN(nn.Module):
         for i in reversed(range(depth)):
             skip_ch = enc_channels[i]
             dec_out = enc_channels[i]
-            self.decoders.append(DecoderBlock(
-                prev_channels, skip_ch, dec_out,
-                num_res_blocks       = num_res_blocks,
-                layers_per_block     = layers_per_block,
-                use_cbam             = use_cbam,
-                use_attention_gates  = use_attention_gates,
-                dropout_rate         = _do(i),
-                cbam_reduction       = cbam_reduction,
-                kernel_size          = dec_kernel_size,
-            ))
+            self.decoders.append(
+                DecoderBlock(
+                    prev_channels,
+                    skip_ch,
+                    dec_out,
+                    num_res_blocks=num_res_blocks,
+                    layers_per_block=layers_per_block,
+                    use_cbam=use_cbam,
+                    use_attention_gates=use_attention_gates,
+                    dropout_rate=_do(i),
+                    cbam_reduction=cbam_reduction,
+                    kernel_size=dec_kernel_size,
+                )
+            )
             prev_channels = dec_out
 
         # ── Output head ──────────────────────────────────────────────────────
@@ -568,21 +529,13 @@ class ACORN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
 
         if x.dim() != 4:
-            raise ValueError(
-                f"Expected 4-D input (batch, C, H, W), got shape {tuple(x.shape)}."
-            )
+            raise ValueError(f"Expected 4-D input (batch, C, H, W), got shape {tuple(x.shape)}.")
         _, in_ch, h, w = x.shape
         expected = self.stem[0].in_channels
         if in_ch != expected:
-            raise ValueError(
-                f"Input has {in_ch} channel(s); model expects {expected}."
-            )
+            raise ValueError(f"Input has {in_ch} channel(s); model expects {expected}.")
         if h < self._min_spatial or w < self._min_spatial:
-            raise ValueError(
-                f"Input ({h}×{w}) too small for depth={self.depth}. "
-                f"Min size: {self._min_spatial}×{self._min_spatial}."
-            )
-
+            raise ValueError(f"Input ({h}×{w}) too small for depth={self.depth}. Min size: {self._min_spatial}×{self._min_spatial}.")
         x = self.stem(x)
 
         skips: List[torch.Tensor] = []
@@ -598,16 +551,14 @@ class ACORN(nn.Module):
         x = self.head(x)
 
         if self.output_size is not None:
-            x = F.interpolate(x, size=self.output_size,
-                              mode="bilinear", align_corners=False)
+            x = F.interpolate(x, size=self.output_size, mode="bilinear", align_corners=False)
         return x
 
     # ─────────────────────────────────────────────────────────────────────────
 
     def summary(self) -> str:
         """Human-readable config and channel progression."""
-        enc_ch = [enc.res_blocks[0].block[0 if not isinstance(enc.res_blocks[0].block[0], nn.Dropout2d) else 1].out_channels
-                  for enc in self.encoders]
+        enc_ch = [enc.res_blocks[0].block[0 if not isinstance(enc.res_blocks[0].block[0], nn.Dropout2d) else 1].out_channels for enc in self.encoders]
         bot_ch = self.bottleneck[-1].block[-2].out_channels  # last BN out
 
         attn_str = []
@@ -622,15 +573,14 @@ class ACORN(nn.Module):
             f"  ACORN-Net  |  attention: {attn_label}",
             f"  enc_kernel={self.enc_kernel_size}  dec_kernel={self.dec_kernel_size}",
             "─" * 52,
-            (f"  in → stem({enc_ch[0]}) → "
-             + " → ".join(f"enc{i+1}({c})" for i, c in enumerate(enc_ch))
-             + f" → bot({bot_ch}) → "
-             + " → ".join(f"dec{i+1}({c})" for i, c in enumerate(reversed(enc_ch)))
-             + f" → head({self.head.out_channels})"),
+            (
+                f"  in → stem({enc_ch[0]}) → "
+                + " → ".join(f"enc{i + 1}({c})" for i, c in enumerate(enc_ch))
+                + f" → bot({bot_ch}) → "
+                + " → ".join(f"dec{i + 1}({c})" for i, c in enumerate(reversed(enc_ch)))
+                + f" → head({self.head.out_channels})"
+            ),
             f"  params: {sum(p.numel() for p in self.parameters()):,}",
             "─" * 52,
         ]
         return "\n".join(lines)
-
-
-

@@ -1,29 +1,26 @@
 {
   "model": "FAC",
-  "version": "ACORN_1_1",
+  "version": "PRIME_1_W_STD",
   "eras": "next",
   "ampere_version": "0_0",
-  "data_version": "op_0_0",
+  "data_version": "prime_1_0",
   "random_seed": 42,
   "input_params": [
     "Vx",
+    "Vx_std",
     "BX_GSE",
+    "BX_GSE_std",
     "BY_GSM",
+    "BY_GSM_std",
     "BZ_GSM",
+    "BZ_GSM_std",
     "proton_density",
+    "proton_density_std",
     "sin_month",
     "cos_month",
     "F107"
   ],
-  "bk_input_params": [
-    "Bz",
-    "By",
-    "Bx",
-    "Vx",
-    "Np",
-    "month_sine",
-    "month_cosine"
-  ],
+  "bk_input_params": ["Bz", "By", "Bx", "Vx", "Np", "month_sine", "month_cosine"],
   "ampere_delay": 0,
   "output_size": [50, 26],
   "shuffling_split_data": true,
@@ -40,13 +37,13 @@
   "storm_extract_param": "SME",
   "storm_extract_limit": 600,
 
-  "specific_test_storms": ["2023-01-04 09:00:00", "2023-05-06 05:00:00"],
+  "specific_test_storms": [],
   "time_history": 60,
   "filters": 128,
   "learning_rate": 1e-6,
-  "epochs": 500,
+  "epochs": 200,
   "loss": "mse",
-  "early_stop_patience": 25,
+  "early_stop_patience": 250,
   "batch_size": 64,
 
   "ampere_path": "~/Volumes/TARDIS/AIMFAHR/ampere_data/",
@@ -59,7 +56,7 @@
   "outputs_dir": "outputs/",
 
   "data_dir": "data/",
-  "sw_data": "prep/omni_10_min_interp.feather",
+  "sw_data": "prep/prime_predictions.feather",
   "indicies_data": "prep/supermag_indicies.feather",
   "F107_data": "prep/fluxtable.txt",
 

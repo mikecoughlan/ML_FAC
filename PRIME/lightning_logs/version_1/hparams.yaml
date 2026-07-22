@@ -1,0 +1,26 @@
+optimizer: adam
+lr: 1.0e-05
+lr_scheduler: const
+patience: 10
+factor: 1
+weight_decay: 0
+total_iters: 40
+in_dim: 11
+tar_dim: 9
+pos_dim: 3
+window: 150
+stride: 35
+interp_frac: 0.1
+decoder_type: prob_linear
+encoder_type: rnn
+decoder_hidden_layers:
+- 256
+- 256
+- 128
+- 64
+encoder_hidden_dim: 256
+encoder_num_layers: 1
+p_drop: 0.0
+pos_encoding_size: 4
+loss: crps
+save_debug_ckpt: false

@@ -1,0 +1,16 @@
+optimizer: adam
+lr: 0.001
+lr_scheduler: cosine
+weight_decay: 0
+in_dim: 14
+tar_dim: 1
+pos_dim: 3
+decoder_type: linear
+encoder_type: rnn
+decoder_hidden_layers:
+- 128
+encoder_hidden_dim: 128
+encoder_num_layers: 1
+p_drop: 0.1
+pos_encoding_size: 8
+loss: mae
