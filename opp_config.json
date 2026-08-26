@@ -2,9 +2,10 @@
 	"model": "FAC",
 	"version": "ACORN_1_1",
 	"eras": "next",
-	"ampere_version": "0_0",
+	"ampere_version": "0_1",
 	"data_version": "op_0_0",
 	"random_seed": 42,
+	"model_architecture": "convhead",
 	"input_params": ["Vx","BX_GSE","BY_GSM","BZ_GSM","proton_density","sin_month","cos_month",
 						"F107"],
 	"bk_input_params": ["Bz", "By", "Bx", "Vx", "Np", "month_sine", "month_cosine"],
@@ -41,6 +42,7 @@
 	"plot_dir": "plots/",
 	"results_dir": "results/",
 	"outputs_dir":"outputs/",
+	"data_dir": "../../../../data/mkcoughl/",
 
 	"model_config": {
 				"in_channels":1,
@@ -55,7 +57,10 @@
 				"dropout_depth":0,
 				"debug":false,
 				"use_cbam":true,
-				"use_attention_gates":true
+				"use_attention_gates":true,
+				"conv_head_hidden_channels":32,
+				"conv_head_num_layers":2,
+				"conv_head_dropout":0.0
 	}
 
 }

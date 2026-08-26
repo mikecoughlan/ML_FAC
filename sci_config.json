@@ -1,16 +1,18 @@
 {
 	"model": "FAC",
-	"version": "ACORN_0_1",
+	"version": "ACORN_sci_rff_2",
 	"eras": "next",
 	"ampere_version": "0_1",
-	"data_version": "sci_0_0",
+	"data_version": "sci_0_4",
 	"random_seed": 42,
+	"shuffled_input_order": ["SML", "SMU", "sin_month", "BZ_GSM", "F107", "proton_density",
+							"BX_GSE", "SYM_H", "ASY_H", "cos_month", "Vx", "BY_GSM", "SME"],
 	"input_params": ["Vx","BX_GSE","BY_GSM","BZ_GSM","proton_density","sin_month","cos_month",
 						"F107","SML", "SMU", "SYM_H", "ASY_H","SME"],
-	"opp_input_params": ["Bz", "By", "Bx", "Vx", "Np", "month_sine", "month_cosine", "F107",
-							"SML", "SMU", "SYM_H", "ASY_H","SME"],
+	"bk_input_params": ["Bz", "By", "Bx", "Vx", "Np", "SMU", "SML", "SYM_H", "ASY_H",
+						"F107", "month_sine", "month_cosine"],
 	"ampere_delay":0,
-
+	"shuffle_input_columns":false,
 	"shuffling_split_data":true,
 	"extract_storms":false,
 	"use_disturbed_time_list":false,
@@ -33,6 +35,7 @@
 	"loss":"mse",
 	"early_stop_patience":25,
 	"batch_size":64,
+	"output_size":[50,26],
 
 	"ampere_path": "~/Volumes/TARDIS/AIMFAHR/ampere_data/",
 	"omni_path": "~/Volumes/TARDIS/AIMFAHR/omni_data/",
@@ -42,6 +45,7 @@
 	"plot_dir": "plots/",
 	"results_dir": "results/",
 	"outputs_dir":"outputs/",
+	"data_dir": "../../../../data/mkcoughl",
 
 	"model_config": {
                 "in_channels":1,
@@ -57,6 +61,7 @@
                 "debug":false,
                 "use_cbam":true,
                 "use_attention_gates":true
+
 	}
 
 }

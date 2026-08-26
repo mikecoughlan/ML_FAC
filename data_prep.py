@@ -49,8 +49,10 @@ os.environ["CDF_LIB"] = "~/CDF/lib"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
 
+CONFIG_PATH = 'sci_config.json'
+
 # Loading CONFIG json file
-with open('sci_config.json', 'r') as f:
+with open(CONFIG_PATH, 'r') as f:
 	CONFIG = json.load(f)
 
 
@@ -69,7 +71,7 @@ class PreparingData():
 		# ---------------------------------------------------------------------
 		# 1. Load configuration from external JSON file
 		# ---------------------------------------------------------------------
-		with open('sci_config.json', 'r') as f:
+		with open(CONFIG_PATH, 'r') as f:
 			# self.config is a dictionary containing general parameters such as:
 			# 'version', 'input_params', 'ampere_version', 'data_version', etc.
 			self.config = json.load(f)
@@ -97,6 +99,8 @@ class PreparingData():
 		self.storm_extract_limit = self.config.get("storm_extract_limit",600)	# Threshold for storm detection
 
 		# Optional testing setup
+		self.shuffle_input_columns = self.config.get("shuffle_input_columns",False)
+		self.shuffle_input_order = self.config.get("shuffle_input_order",None)
 		self.time_history = self.config.get("time_history", 60)									# Length of input time history sequences
 		self.specific_test_storms = self.config.get("specific_test_storms", None)					# List of storms to force into test set
 		self.eras = self.config.get("eras", "next")																# Which eras to include: 'block_1', 'next', 'both'
@@ -742,6 +746,21 @@ class PreparingData():
 
 		# --- Step 1: Setup and data extraction ---
 		df = self.solarwind.copy()
+		if self.shuffle_input_columns:
+			if self.shuffle_input_order:
+				df = df[self.shuffle_input_order]
+			else:
+				df_cols = [col for col in df.columns]
+				while df_cols[0] == 'Vx' or df_cols[-1] == 'Vx' or df_cols[0] == 'ASY_H' or df_cols[-1] == 'ASY_H':
+					df = df.sample(frac=1, axis=1)
+					df_cols = [col for col in df.columns]
+				self.shuffle_input_order = df_cols
+				self.config['shuffle_input_order'] = df_cols
+				print(f'SHUFFLED INPUT COLUMNS NEW ORDER: {self.shuffle_input_order}')
+				# self.config['shuffled_input_order'] = self.shuffle_input_order
+				# Loading CONFIG json file
+				with open(CONFIG_PATH, "w") as f:
+					json.dump(self.config, f)
 		df.drop(self.storm_extract_param, axis=1, inplace=True, errors='ignore')  # Remove storm extraction column if present
 		data_values = df.to_numpy()			# Convert full dataset to NumPy array for fast slicing
 		index = df.index					# Pandas index (time-based)
@@ -1124,7 +1143,7 @@ class PreparingData():
 			train, val, test (dicts): dictionaries containing the training, validation and testing data
 
 		'''
-
+		print(self.data_dir+f'prepared_data/fully_prepared_{self.eras}_{self.data_version}_disturbed_time_{self.extract_storms}.pkl')
 		if os.path.exists(self.data_dir+f'prepared_data/fully_prepared_{self.eras}_{self.data_version}_disturbed_time_{self.extract_storms}.pkl'):
 			print('Loading pre-processed data....')
 			with open(self.data_dir+f'prepared_data/fully_prepared_{self.eras}_{self.data_version}_disturbed_time_{self.extract_storms}.pkl', 'rb') as f:

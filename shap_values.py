@@ -761,7 +761,10 @@ def main():
 	# ------------------------------------------------------------------
 	print('Loading data...')
 	PD = PreparingData()
-	train_dict, val_dict, test_dict = PD()
+	train_dict, val_dict, __ = PD()
+
+	with open(f"outputs/FAC_{CONFIG['version']}_next_storm_training_False_results_additional_times.pkl", 'rb') as f:
+		test_dict = pickle.load(f)
 
 	dates = [date for date in test_dict.keys()]
 
@@ -808,6 +811,9 @@ def main():
 		mlt_end   = region['mlt_end']
 
 		tag = region_tag(mlat_low, mlat_high, mlt_start, mlt_end)
+		out_path = working_dir + f'/shap/{CONFIG["version"]}_{EXPLAINER_TYPE}_{tag}.pkl'
+		if os.path.exists(out_path):
+			continue
 		print(f'\n{"="*60}')
 		print(f'Region {i + 1}/{n_regions}: {tag}')
 		print(f'{"="*60}')
@@ -838,7 +844,7 @@ def main():
 			checkpoint_dir=ckpt_dir,
 		)
 
-		out_path = working_dir + f'/shap/{CONFIG["version"]}_{EXPLAINER_TYPE}_{tag}.pkl'
+
 		print(f'Saving results → {out_path}')
 		with open(out_path, 'wb') as f:
 			pickle.dump(

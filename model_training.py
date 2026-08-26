@@ -46,7 +46,7 @@ from custom_loss_functions import (CRPS, WeightedCRPS,
                                    WeightedMeanSquaredError,
                                    create_bin_weights)
 from data_prep import PreparingData
-from model_classes_test import *
+from model_classes import *
 
 pd.options.mode.chained_assignment = None
 
@@ -58,7 +58,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
 
 # Loading CONFIG json file
-with open('opp_config.json', 'r') as f:
+with open('sci_config.json', 'r') as f:
 	CONFIG = json.load(f)
 
 if not os.path.exists(CONFIG["model_dir"]):
