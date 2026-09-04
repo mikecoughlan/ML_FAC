@@ -219,7 +219,6 @@ __marimo__/
 
 # Specific files
 acorn_rff.py
-config.json
 correlation_length.py
 spatial_correlation.py
 storm_time_list.csv
@@ -230,7 +229,9 @@ plots/
 models/
 outputs/
 shap/
-*.ipynb
+file_of_holding/
+initial_version_of_code/
+nasaomnireader-master/
 *.png
 *.mp4
 

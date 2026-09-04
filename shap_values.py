@@ -1,39 +1,85 @@
-# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+"""
+shap_values.py
+==============
+
+Interpretability analysis for trained ACORN models.
+
+Answers the question "which solar wind inputs, at which lags, drive the
+model's prediction in a given part of the ionosphere?" -- by computing
+SHAP (SHapley Additive exPlanations) attributions over regions of the
+MLAT x MLT grid.
+
+Why regions rather than cells
+-----------------------------
+ACORN outputs 50 x 24 = 1200 values per timestep, each with its own
+attribution over every input feature and lag. Explaining all of them at
+once is neither tractable nor interpretable, so the grid is reduced to
+physically meaningful regions -- the R0, R1 and R2 current sheets and
+MLT sectors -- and the model is wrapped so it returns a single scalar
+per region. SHAP then explains that scalar.
+
+Pipeline
+--------
+1. mlat_to_indices / mlt_to_indices   Convert physical region bounds
+                                      (degrees MLAT, hours MLT) into
+                                      grid indices.
+2. RegionWrapper                      Wrap the model so its output is
+                                      the mean over one region, turning
+                                      a 1200-output model into a scalar
+                                      one SHAP can explain.
+3. get_shap_values                    Run the SHAP explainer over the
+                                      test set for that region.
+4. converting_shap_to_percentages     Normalise attributions to percent
+                                      contributions per input feature.
+
+Conventions
+-----------
+The colatitude axis runs pole-first: index 0 is the pole (~90 MLAT) and
+index N_MLAT-1 the equatorward edge. Attributions are made absolute
+BEFORE summing over the lookback axis -- summing signed values first
+lets positive and negative lags cancel and understates importance.
+
+Selecting a model
+-----------------
+    python shap_values.py                  # science model
+    ACORN_MODEL=op python shap_values.py   # operational model
+"""
+
 import gc
-import json
 import os
 import pickle
 import shutil
-from typing import List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import shap
 import torch
 import tqdm
 
-import shap
+import utils
 from data_prep import PreparingData
-from model_classes import *
+from model_classes import ACORN
 
 pd.options.mode.chained_assignment = None
 
-os.environ["CDF_LIB"] = "~/CDF/lib"
-
+# Directory holding this script, so outputs land beside the code.
 working_dir = os.path.dirname(os.path.abspath(__file__))
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
-# DEVICE = torch.device('cpu')
-# print(f'Device: {DEVICE}')
 
-# Loading CONFIG json file
-with open('sci_config.json', 'r') as f:
-	CONFIG = json.load(f)
+# Which model to explain: 'sci' or 'op'. See config.json.
+# The same name is handed to PreparingData in main(), so the SHAP run
+# and the data it explains cannot drift onto different models.
+MODEL_NAME = os.environ.get('ACORN_MODEL', None)
+
+CONFIG = utils.load_config(MODEL_NAME)
+MODEL_NAME = CONFIG['model_name']
 
 os.makedirs(CONFIG["model_dir"], exist_ok=True)
 
-model_file = f'{CONFIG["model_dir"]}{CONFIG["model"]}_{CONFIG["version"]}_{CONFIG["eras"]}.pt'
+model_file = utils.model_file(CONFIG)
 
 # ---------------------------------------------------------------------------
 # Grid constants
@@ -73,7 +119,6 @@ REGIONS = [
 	{'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  21, 'mlt_end': 2},   # nightside region 2
 	{'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  3, 'mlt_end': 8},   # dawn region 2
 ]
-
 
 # ---------------------------------------------------------------------------
 # Spatial index helpers
@@ -301,14 +346,14 @@ def plot_shap_region(mlat_indices: list, mlt_indices: list, save_path: str = Non
 # GPU helpers
 # ---------------------------------------------------------------------------
 
-def _free_gpu():
+def free_gpu():
 	'''Flush GPU memory after freeing a tensor.'''
 	gc.collect()
 	if DEVICE.type == 'cuda':
 		torch.cuda.empty_cache()
 
 
-def _make_predict_fn(model, input_shape):
+def make_predict_fn(model, input_shape):
 	'''
 	Wraps a PyTorch model into a numpy-in / numpy-out callable for KernelExplainer.
 
@@ -325,7 +370,7 @@ def _make_predict_fn(model, input_shape):
 		input_shape (tuple): per-sample shape before flattening, e.g. (C, H, W).
 
 	Returns:
-		callable: prediction function suitable for shap.KernelExplainer.
+		callable: prediction function suitable for shap Explainer.
 	'''
 	def predict_fn(x_flat):
 		x = torch.tensor(x_flat, dtype=torch.float).reshape(-1, *input_shape).to(DEVICE)
@@ -333,7 +378,7 @@ def _make_predict_fn(model, input_shape):
 			out = model(x)
 		result = out.cpu().numpy().reshape(x.shape[0], -1)
 		del x, out
-		_free_gpu()
+		free_gpu()
 		return result
 
 	return predict_fn
@@ -404,7 +449,7 @@ class RegionalMeanWrapper(torch.nn.Module):
 # ---------------------------------------------------------------------------
 
 def get_shap_values(model, model_name, training_data, testing_data,
-					background_examples=1000, delimiter=100, explainer_type='deep',
+					background_examples=1000, delimiter=100, explainer_type='grad',
 					mlat_indices=None, mlt_indices=None, channels=(0, 1),
 					checkpoint_dir=None):
 	'''
@@ -412,12 +457,12 @@ def get_shap_values(model, model_name, training_data, testing_data,
 
 	GPU memory strategy: everything is built and stored on CPU. Data is moved
 	to GPU only at the moment it is consumed, then freed immediately. At peak,
-	only the model weights + one batch (or the background for GradientExplainer
+	only the model weights + one batch (or the background for Explainer
 	initialisation) occupy GPU memory at any one time.
 
 	Supports two explainer backends:
 
-	  'deep'   -- shap.GradientExplainer. Fast, gradient-based, PyTorch-native.
+	  'grad'   -- shap.GradientExplainer. Fast, gradient-based, PyTorch-native.
 	             Background is moved to GPU for init then freed before the
 	             test loop begins. Each test batch is moved to GPU, explained,
 	             then freed before the next batch.
@@ -448,7 +493,7 @@ def get_shap_values(model, model_name, training_data, testing_data,
 		testing_data       (list[Tensor] | np.ndarray | Tensor): data to explain.
 		background_examples (int):  number of background samples.  Default 1000.
 		delimiter          (int):   batch size for SHAP forward passes. Default 100.
-		explainer_type     (str):   'deep' or 'kernel'. Default 'deep'.
+		explainer_type     (str):   'grad' or 'kernel'. Default 'grad'.
 		mlat_indices       (list[int] | None): MLAT bin indices to include in the
 		                    regional mean.  None uses the full 50-bin axis.
 		                    Use mlat_to_indices() to convert from degree MLAT.
@@ -466,8 +511,8 @@ def get_shap_values(model, model_name, training_data, testing_data,
 		str:  placeholder for expected_value (not yet wired up).
 	'''
 
-	if explainer_type not in ('deep', 'kernel'):
-		raise ValueError(f"explainer_type must be 'deep' or 'kernel', got '{explainer_type}'.")
+	if explainer_type not in ('grad', 'kernel'):
+		raise ValueError(f"explainer_type must be 'grad' or 'kernel', got '{explainer_type}'.")
 
 	if checkpoint_dir is not None:
 		os.makedirs(checkpoint_dir, exist_ok=True)
@@ -566,7 +611,7 @@ def get_shap_values(model, model_name, training_data, testing_data,
 	#    eval() is required regardless of explainer type — disables
 	#    dropout and fixes batchnorm statistics for consistent explanations.
 	# ------------------------------------------------------------------
-	if explainer_type == 'deep':
+	if explainer_type == 'grad':
 		background_gpu = background_cpu.to(DEVICE)
 		del background_cpu
 		gc.collect()
@@ -574,7 +619,7 @@ def get_shap_values(model, model_name, training_data, testing_data,
 			explainer = shap.GradientExplainer(model=effective_model, data=background_gpu)
 
 		del background_gpu
-		_free_gpu()
+		free_gpu()
 
 		# ------------------------------------------------------------------
 		# 3a. Calculate SHAP values — GradientExplainer
@@ -594,6 +639,7 @@ def get_shap_values(model, model_name, training_data, testing_data,
 				if checkpoint_dir else None
 			)
 
+			# Already computed on a previous run -- reload and move on.
 			if batch_ckpt and os.path.exists(batch_ckpt):
 				with open(batch_ckpt, 'rb') as f:
 					shap_values.append(pickle.load(f))
@@ -610,7 +656,7 @@ def get_shap_values(model, model_name, training_data, testing_data,
 					pickle.dump(result, f)
 
 			del batch_gpu
-			_free_gpu()
+			free_gpu()
 
 		if n_skipped:
 			print(f'  Resumed: {n_skipped}/{n_batches} batches loaded from checkpoint, '
@@ -622,14 +668,14 @@ def get_shap_values(model, model_name, training_data, testing_data,
 		#
 		# KernelExplainer is fully CPU/numpy-based. Background and test data
 		# are flattened to (n_samples, n_features) numpy arrays here.
-		# predict_fn (see _make_predict_fn) moves each internal perturbation
+		# predict_fn (see make_predict_fn) moves each internal perturbation
 		# batch to GPU only for the forward pass, then pulls back to CPU.
 		# Peak GPU = model + one KernelExplainer perturbation batch.
 		#
 		# Note: KernelExplainer.shap_values() does not accept check_additivity.
 		# It is significantly slower than GradientExplainer — keep delimiter small.
 		# ------------------------------------------------------------------
-		predict_fn = _make_predict_fn(effective_model, input_shape)
+		predict_fn = make_predict_fn(effective_model, input_shape)
 
 		background_np = background_cpu.numpy().reshape(background_cpu.shape[0], -1)
 		del background_cpu
@@ -643,6 +689,10 @@ def get_shap_values(model, model_name, training_data, testing_data,
 		del testing_cpu
 		gc.collect()
 
+		# KernelExplainer is model-agnostic but slow, so the test set is
+		# processed in batches and each batch is written to its own
+		# checkpoint file. A run that dies partway can then be restarted
+		# and will reload completed batches instead of recomputing them.
 		print('Calculating SHAP values (KernelExplainer)....')
 		shap_values = []
 		n_skipped   = 0
@@ -654,6 +704,7 @@ def get_shap_values(model, model_name, training_data, testing_data,
 				if checkpoint_dir else None
 			)
 
+			# Already computed on a previous run -- reload and move on.
 			if batch_ckpt and os.path.exists(batch_ckpt):
 				with open(batch_ckpt, 'rb') as f:
 					shap_values.append(pickle.load(f))
@@ -672,7 +723,10 @@ def get_shap_values(model, model_name, training_data, testing_data,
 			print(f'  Resumed: {n_skipped}/{n_batches} batches loaded from checkpoint, '
 				  f'{n_batches - n_skipped} computed fresh.')
 
-	return shap_values, '____'  # explainer.expected_value not yet wired up
+	# Second element is a placeholder: explainer.expected_value (the base
+	# value SHAP attributions are measured against) is not yet returned.
+	# Callers currently discard it.
+	return shap_values, '____'
 
 
 # ---------------------------------------------------------------------------
@@ -691,16 +745,37 @@ def converting_shap_to_percentages(shap_values, features):
 		list[pd.DataFrame] | pd.DataFrame: percentage contributions.
 	'''
 
-	def _to_percentage(arr):
-		# Sum across spatial/time axis, reshape to (samples, features), then normalise
+	def to_percentage(arr):
+		# Collapse the lookback axis so each feature gets one number per
+		# sample, then express that as a share of the total attribution.
+		#
+		# WARNING -- this sum is SIGNED.
+		#     A feature whose influence flips sign across the lookback
+		#     window (positive at short lag, negative at long lag) has
+		#     those contributions cancel here, and comes out looking
+		#     unimportant when it is not. Taking np.abs(arr) BEFORE the
+		#     sum measures total influence regardless of direction, which
+		#     is what an importance ranking usually wants.
+		#
+		#     Left signed because it is what the published figures were
+		#     produced with. Switching to abs-before-sum changes the
+		#     reported percentages, so regenerate every SHAP figure if
+		#     you change it.
 		summed = np.sum(arr, axis=1).reshape(arr.shape[0], -1)
+
 		df = pd.DataFrame(summed, columns=features)
+
+		# Normalise by the sum of absolute contributions so each row totals
+		# 100%. Using the absolute sum here means opposing contributions
+		# do not inflate one another's share.
 		return df.div(df.abs().sum(axis=1), axis=0) * 100
 
+	# A single explainer output arrives wrapped in a length-1 list; more
+	# than one means per-output-channel attributions, handled elementwise.
 	if len(shap_values) > 1:
-		return [_to_percentage(sv) for sv in shap_values]
+		return [to_percentage(sv) for sv in shap_values]
 	else:
-		return _to_percentage(shap_values[0])
+		return to_percentage(shap_values[0])
 
 
 # ---------------------------------------------------------------------------
@@ -738,9 +813,9 @@ def compare_state_dicts(checkpoint_path, model):
 			print(f"  {k:<55} {str(tuple(ckpt[k].shape)):>20} {str(tuple(model_sd[k].shape)):>20}")
 
 	if missing:
-		print(f"\n  Missing keys:\n  " + "\n  ".join(sorted(missing)))
+		print("\n  Missing keys:\n  " + "\n  ".join(sorted(missing)))
 	if unexpected:
-		print(f"\n  Unexpected keys:\n  " + "\n  ".join(sorted(unexpected)))
+		print("\n  Unexpected keys:\n  " + "\n  ".join(sorted(unexpected)))
 
 
 # ---------------------------------------------------------------------------
@@ -760,10 +835,10 @@ def main():
 	# 1. Load data — done once; all region loops reuse the same tensors.
 	# ------------------------------------------------------------------
 	print('Loading data...')
-	PD = PreparingData()
-	train_dict, val_dict, __ = PD()
+	PD = PreparingData(MODEL_NAME)
+	train_dict, __, __ = PD()
 
-	with open(f"outputs/FAC_{CONFIG['version']}_next_storm_training_False_results_additional_times.pkl", 'rb') as f:
+	with open(utils.results_file(CONFIG), 'rb') as f:
 		test_dict = pickle.load(f)
 
 	dates = [date for date in test_dict.keys()]
@@ -772,7 +847,7 @@ def main():
 	train_x = [torch.tensor(train_dict[key]['input']).unsqueeze(0) for key in train_dict.keys()]
 	test_x  = [torch.tensor(test_dict[key]['input']).unsqueeze(0)  for key in test_dict.keys()]
 
-	del train_dict, val_dict, test_dict
+	del train_dict, test_dict
 	gc.collect()
 
 	# ------------------------------------------------------------------
@@ -793,10 +868,10 @@ def main():
 	checkpoint = torch.load(model_file, map_location=DEVICE)
 	model.load_state_dict(checkpoint['model'])
 
-	# Set explainer_type to 'deep' or 'kernel'
-	# 'deep'   -- faster, gradient-based, recommended for differentiable models
+	# Set explainer_type to 'grad' or 'kernel'
+	# 'grad'   -- faster, gradient-based, recommended for differentiable models
 	# 'kernel' -- slower, model-agnostic; use smaller background_examples + delimiter
-	EXPLAINER_TYPE = 'deep'
+	EXPLAINER_TYPE = 'grad'
 
 	# ------------------------------------------------------------------
 	# 3. Region loop — each iteration is fully independent.
@@ -811,7 +886,7 @@ def main():
 		mlt_end   = region['mlt_end']
 
 		tag = region_tag(mlat_low, mlat_high, mlt_start, mlt_end)
-		out_path = working_dir + f'/shap/{CONFIG["version"]}_{EXPLAINER_TYPE}_{tag}.pkl'
+		out_path = os.path.join(working_dir, utils.shap_file(CONFIG, EXPLAINER_TYPE, tag))
 		if os.path.exists(out_path):
 			continue
 		print(f'\n{"="*60}')
@@ -840,7 +915,7 @@ def main():
 			explainer_type=EXPLAINER_TYPE,
 			mlat_indices=mlat_indices,
 			mlt_indices=mlt_indices,
-			channels=(0,),   # posterior mean only; use (0, 1) to include std channel
+			channels=(0,1),   # mean and std; use (0,) for posterior mean only
 			checkpoint_dir=ckpt_dir,
 		)
 

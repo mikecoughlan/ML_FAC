@@ -2,65 +2,44 @@
 model_classes.py
 =================
 ACORN -- Attention COnvolutional Residual Network. This is the single,
-consolidated model definition file: architecture (CBAM, AttentionGate,
-ResidualBlock, EncoderBlock, DecoderBlock), RFF/sham position encoding, and
-the spatial conv refinement head all live here as one ACORN class with
-everything gated behind optional kwargs.
+consolidated model definition file: the attention and residual building
+blocks (CBAM, AttentionGate, ResidualBlock, EncoderBlock, DecoderBlock)
+and the spatial refinement head all live here, assembled by one ACORN
+class.
 
-Nothing about model_training.py needs to change to use any of this --
 model_training.py calls ACORN(**model_config), and model_config comes
-straight from the config file. What's in that config's model_config block
-controls what gets built:
+straight from config.json, so what is in that block is what gets built.
+Attention is switchable via use_cbam / use_attention_gates; the
+refinement head is always built and its width, depth and dropout are
+adjustable through conv_head_hidden_channels / conv_head_num_layers /
+conv_head_dropout.
 
-    "use_rff_position": true, "rff_freq_scale_lat": 8.0, ...   -> RFF
-    "use_sham_position": true, ...                              -> sham control
-    "use_conv_head": false                                      -> plain 1x1 head (old default)
-    (omit use_conv_head)                                        -> conv head (current default, see below)
-
-DEFAULT CHANGED: use_conv_head now defaults to True -- the conv head
-consistently outperformed the plain 1x1 head in testing, so it's the
-default rather than something to opt into. Loading a checkpoint saved
-BEFORE this default flipped requires passing use_conv_head=False
-explicitly, or load_state_dict will fail on a head-shape mismatch.
-
-Any kwarg this class doesn't recognize is accepted and ignored with a
+Unrecognized kwargs
+-------------------
+A kwarg this class does not recognize is accepted and ignored with a
 printed warning rather than raising TypeError -- a safety net against a
-config carrying a stray/future key, not a substitute for actually wiring up
-a kwarg you intend to have an effect.
+config carrying a stray or future key, not a substitute for wiring up a
+kwarg you intend to have an effect. Keys belonging to features that no
+longer exist raise instead, since silently ignoring those would build
+something other than what the config asked for.
 
-Why the conv head exists: the plain head is `nn.Conv2d(..., kernel_size=1)`
--- zero spatial receptive field, a fixed per-pixel linear combination of
-channels with no access to neighboring pixels. Pixel-level CRPS delta maps
-from the RFF-vs-sham ablation showed radial, sign-flipping structure right
-at the R0/R1 boundary, consistent with the model trying to shift or sharpen
-a boundary -- inherently a neighborhood operation a 1x1 conv can't do.
-The conv head inserts 1-2 real (kernel_size=3) conv layers between the
-RFF/sham concatenation and the final per-pixel projection, giving the
-network that mechanism. (Result: the conv head alone, with NO position
-information, outperformed every RFF/sham variant tested with the plain
-head -- see project notes. RFF/sham on top of the conv head so far
-haven't beaten the conv head alone.)
-
-IMPORTANT -- MLT wrap-padding convention:
-  The training pipeline pads AMPERE targets with Y[:,-1:] (column 23) at
-  the front -- [23, 0, 1, ..., 23, 0]. RFFPositionEncoding's default
-  `wrap_front_source_idx=-1` matches this. Only pass `wrap_front_source_idx=-2`
-  if deliberately working with an old checkpoint that used the since-fixed
-  buggy Y[:,-2:-1] (column 22) convention.
+MLT wrap-padding convention
+---------------------------
+The training pipeline pads AMPERE targets with Y[:, -1:] (column 23) at
+the front, giving [23, 0, 1, ..., 23, 0]. THis is removed in the model
+evaluation stage so the final results is teh normal 50x24 array
 """
 
 from __future__ import annotations
 
-import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ═══════════════════════════════════════════════════════════════════════════
-# Attention modules (unchanged from model_classes.py)
+# Attention modules
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ChannelAttention(nn.Module):
@@ -115,7 +94,7 @@ class CBAM(nn.Module):
 
 
 class AttentionGate(nn.Module):
-    """Additive attention gate for skip connections (Oktay et al., 2018)."""
+    """Additive attention gate for skip connections."""
 
     def __init__(self, skip_channels: int, gate_channels: int):
         super().__init__()
@@ -142,7 +121,7 @@ class AttentionGate(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Core residual block (unchanged from model_classes.py)
+# Core residual block
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ResidualBlock(nn.Module):
@@ -188,10 +167,17 @@ class ResidualBlock(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Encoder / Decoder blocks (unchanged from model_classes.py)
+# Encoder / Decoder blocks
 # ═══════════════════════════════════════════════════════════════════════════
 
 class EncoderBlock(nn.Module):
+    '''
+    Block made up of residual sections with skip connections. Reduces
+    the dimensions of it's output by using a pooling layer at the end,
+    distinguishing it from teh decoder block which expands the dimensions.
+    Also generates the array used for the U-Net skip connections.
+
+    '''
     def __init__(
         self,
         in_channels: int,
@@ -214,11 +200,25 @@ class EncoderBlock(nn.Module):
         self.pool = nn.MaxPool2d(2)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        '''
+        Call for the encoder block
+
+        Args:
+            x (torch.Tensor): output of the previous layer
+
+        Returns:
+            torch.Tensor: pooled output of the encoder block
+            torch.Tensor: non-pooled output used to make U-Net skip connection
+        '''
         skip = self.res_blocks(x)
         return self.pool(skip), skip
 
 
 class DecoderBlock(nn.Module):
+    '''
+    Block made up of residual sections with skip connections. Expands
+    the dimensions of its output using a bi-linear interpolation.
+    '''
     def __init__(
         self,
         in_channels: int,
@@ -245,152 +245,30 @@ class DecoderBlock(nn.Module):
         self.res_blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        '''
+        Call for the decoder block
+
+        Args:
+            x (torch.Tensor): output of the previous layer
+            skip (torch.Tensor): output of the conjugate encoder block
+
+        Returns:
+            torch.Tensor: expanded output of the decoder block, combined with encoder skip output
+        '''
         if self.attention_gate is not None:
             skip = self.attention_gate(skip, x)
         x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
         return self.res_blocks(torch.cat([x, skip], dim=1))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# RFF position encoding
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _build_wrapped_mlt_hours(n_mlt: int, wrap_front_source_idx: int) -> torch.Tensor:
-    """Real MLT hours at each of the (n_mlt + 2) wrap-padded column positions,
-    e.g. wrap_front_source_idx=-1 -> [23, 0, 1, ..., 23, 0] (the originally-
-    intended scheme, matching the FIXED pipeline). Use -2 only if working
-    with the old checkpoint's buggy [22, 0, ..., 23, 0] convention.
-    """
-    hours = torch.arange(n_mlt, dtype=torch.float32)
-    idx = wrap_front_source_idx % n_mlt
-    front = hours[idx:idx + 1]
-    back = hours[0:1]
-    return torch.cat([front, hours, back])
-
-
-class RFFPositionEncoding(nn.Module):
-    """
-    Random Fourier Feature position encoding for a static (grid_rows,
-    grid_cols) output grid, with independent frequency scales for MLAT and
-    MLT.
-
-    Each of the m random frequency vectors nu[i] is 3-dimensional -- one
-    component per coordinate axis: [MLAT_norm, sin(MLT), cos(MLT)]. The
-    MLAT component is drawn from N(0, freq_scale_lat^2); the two MLT
-    components are drawn from N(0, freq_scale_mlt^2) -- every frequency
-    still mixes both axes (MLAT-MLT-coupled structure is representable),
-    but the typical magnitude along each axis is controlled independently.
-
-    Handles both the natural (n_mlt) grid and the wrap-padded (n_mlt + 2)
-    grid automatically, based on grid_cols vs. n_mlt.
-
-    Optionally supplements this with a small deterministic harmonic block
-    for MLT: cos(k*theta), sin(k*theta) for k=1..max_mlt_harmonic, the true
-    Fourier harmonics of a periodic signal -- independent of, and appended
-    alongside, the random features.
-    """
-
-    def __init__(
-        self,
-        grid_rows: int,
-        grid_cols: int,
-        num_frequencies: int = 32,
-        freq_scale_lat: float = 5.0,
-        freq_scale_mlt: float = 5.0,
-        mlat_span_deg: float = 50.0,
-        n_mlt: int = 24,
-        wrap_front_source_idx: int = -1,   # matches the FIXED pipeline; see module docstring
-        seed: int = 0,
-        include_mlt_harmonics: bool = False,
-        max_mlt_harmonic: int = 4,
-    ):
-        super().__init__()
-
-        rows = torch.arange(grid_rows, dtype=torch.float32) + 0.5
-        mlat_norm = rows / mlat_span_deg
-
-        if grid_cols == n_mlt:
-            mlt_hours = torch.arange(n_mlt, dtype=torch.float32) + 0.5
-        elif grid_cols == n_mlt + 2:
-            mlt_hours = _build_wrapped_mlt_hours(n_mlt, wrap_front_source_idx) + 0.5
-        else:
-            raise ValueError(
-                f"grid_cols={grid_cols} matches neither the natural MLT grid "
-                f"(n_mlt={n_mlt}) nor the wrap-padded grid (n_mlt+2={n_mlt+2}). "
-                "Pass the correct n_mlt, or add a case for this grid shape."
-            )
-        mlt_frac = mlt_hours / n_mlt
-
-        MLAT, MLT_FRAC = torch.meshgrid(mlat_norm, mlt_frac, indexing="ij")   # (H, W)
-        mlt_theta = 2 * math.pi * MLT_FRAC
-
-        coords = torch.stack([MLAT, torch.sin(mlt_theta), torch.cos(mlt_theta)], dim=0)   # (3, H, W)
-        coords_flat = coords.reshape(3, -1)
-
-        g = torch.Generator().manual_seed(seed)
-        nu_lat = torch.randn(num_frequencies, 1, generator=g) * freq_scale_lat
-        nu_mlt = torch.randn(num_frequencies, 2, generator=g) * freq_scale_mlt
-        nu = torch.cat([nu_lat, nu_mlt], dim=1)   # (m, 3)
-
-        proj = 2 * math.pi * (nu @ coords_flat)                       # (m, H*W)
-        gamma = torch.cat([torch.cos(proj), torch.sin(proj)], dim=0)   # (2m, H*W)
-        out_channels = 2 * num_frequencies
-
-        if include_mlt_harmonics:
-            theta_flat = mlt_theta.reshape(-1)
-            k = torch.arange(1, max_mlt_harmonic + 1, dtype=torch.float32)
-            phase = k[:, None] * theta_flat[None, :]
-            harmonics = torch.cat([torch.cos(phase), torch.sin(phase)], dim=0)
-            gamma = torch.cat([gamma, harmonics], dim=0)
-            out_channels += 2 * max_mlt_harmonic
-
-        gamma = gamma.reshape(1, out_channels, grid_rows, grid_cols)
-
-        self.register_buffer("gamma", gamma)
-        self.out_channels = out_channels
-
-    def forward(self, batch_size: int) -> torch.Tensor:
-        return self.gamma.expand(batch_size, -1, -1, -1)
-
-
-class NoisePositionEncoding(nn.Module):
-    """
-    Fixed random-noise channels, same interface as RFFPositionEncoding
-    (out_channels attribute, forward(batch_size) -> fixed buffer expanded
-    over batch). Exists purely as a capacity-matched SHAM CONTROL: if
-    concatenating this instead of real RFF features produces a similar CRPS
-    change, the RFF result isn't really about position information -- it's
-    about the head having more input channels and training slightly
-    differently as a result. Use the same out_channels count as whatever RFF
-    config you're comparing against for a clean, isolated comparison.
-    """
-
-    def __init__(self, grid_rows: int, grid_cols: int, out_channels: int, seed: int = 999):
-        super().__init__()
-        g = torch.Generator().manual_seed(seed)
-        noise = torch.randn(1, out_channels, grid_rows, grid_cols, generator=g)
-        self.register_buffer("noise", noise)
-        self.out_channels = out_channels
-
-    def forward(self, batch_size: int) -> torch.Tensor:
-        return self.noise.expand(batch_size, -1, -1, -1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Spatial conv refinement head
-# ═══════════════════════════════════════════════════════════════════════════
-
 class ConvRefinementHead(nn.Module):
     """
     Small spatial refinement block: `num_layers` kernel_size=3 conv layers
     (BatchNorm + ReLU, optional dropout), then a final 1x1 projection to
-    out_channels -- structurally the same final projection the plain head
-    does, just preceded by layers that can actually see neighboring pixels
-    first (a 1x1 conv can't -- zero spatial receptive field).
+    out_channels.
 
     `out_channels` is exposed as a plain attribute (not inferred from
-    nn.Sequential, which has none) so ACORN.summary() keeps working
-    regardless of which head type is active.
+    nn.Sequential, which has none) so ACORN.summary() keeps working.
     """
 
     def __init__(self, in_channels: int, out_channels: int,
@@ -418,86 +296,28 @@ class ConvRefinementHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ACORN-Net
+# ACORN
 # ═══════════════════════════════════════════════════════════════════════════
 
 class ACORN(nn.Module):
     """
     ACORN -- Attention COnvolutional Residual Network.
 
-    A Residual U-Net with independently toggleable CBAM and Attention Gates,
-    plus optional RFF position encoding concatenated onto the output right
-    after the final resize (the only point where MLAT/MLT is actually known
-    in this architecture -- the encoder/decoder axes are time-history x
-    input-feature, not space).
+    A Residual U-Net with independently toggleable CBAM and Attention
+    Gates, followed by a spatial refinement head.
 
-    Core parameters (unchanged from model_classes.py)
-    --------------------------------------------------
+    Note the encoder/decoder axes are time-history x input-feature, not
+    space. The output is resized to the MLAT x MLT grid only at the final
+    interpolation step, which is the first and only point at which the
+    spatial layout is meaningful -- and therefore where the refinement
+    head operates.
+
+    Core parameters
+    ---------------
     in_channels, out_channels, base_channels, depth, num_res_blocks,
     layers_per_block, channel_mult, cbam_reduction, use_cbam,
     use_attention_gates, dropout_rate, dropout_depth, output_size,
-    input_size, debug -- see original docstrings; behavior unchanged.
-
-    RFF parameters (new)
-    ---------------------
-    use_rff_position       : If True, concatenate RFF position features
-                              onto the interpolated output before head.
-    rff_num_frequencies    : Number of random frequency pairs (m). Output
-                              channels from the random block = 2m.
-    rff_freq_scale_lat     : Frequency-scale (bandwidth) for the MLAT axis.
-    rff_freq_scale_mlt     : Frequency-scale (bandwidth) for the MLT axis.
-    rff_mlat_span_deg      : Normalization span for MLAT coordinates.
-    rff_n_mlt              : Real number of MLT hours (24) -- used to detect
-                              whether output_size's column count is the
-                              natural grid or the wrap-padded grid.
-    rff_wrap_front_source_idx : Which column gets duplicated at the front of
-                              the wrap-padded grid. -1 matches the current
-                              pipeline (originally-intended scheme); -2 only
-                              for loading an old checkpoint that used the
-                              since-fixed buggy convention. See module docstring.
-    rff_seed                : Random seed for the fixed frequency draw.
-    rff_include_mlt_harmonics : If True, append a deterministic MLT harmonic
-                              block (true Fourier harmonics) alongside the
-                              random features.
-    rff_max_mlt_harmonic     : Highest harmonic order if the above is True.
-
-    Sham-control parameters (new)
-    -------------------------------
-    use_sham_position       : If True, concatenate fixed random NOISE
-                              channels instead of RFF position features --
-                              mutually exclusive with use_rff_position.
-                              Capacity-matched control for isolating whether
-                              an RFF effect is really about position.
-    sham_num_channels        : Channel count for the noise block. If None,
-                              defaults to 2 * rff_num_frequencies so it's
-                              easy to keep exactly capacity-matched to a
-                              particular RFF config by reusing that config's
-                              rff_num_frequencies value.
-    sham_seed                : Random seed for the fixed noise draw.
-
-    Conv-head parameters (new)
-    ----------------------------
-    use_conv_head            : Default True -- the conv head consistently
-                              outperformed the plain 1x1 head in testing
-                              (see project notes), so it's now the default
-                              rather than something to opt into.
-                              IMPORTANT: any OLD checkpoint saved before this
-                              default flipped was trained with a plain 1x1
-                              head. Loading one now requires passing
-                              use_conv_head=False explicitly, or
-                              load_state_dict will fail on a head-shape
-                              mismatch.
-    conv_head_hidden_channels : Channel width of the refinement layers.
-    conv_head_num_layers      : How many kernel_size=3 layers before the
-                              final 1x1 projection.
-    conv_head_dropout         : Dropout rate inside the refinement block
-                              (0.0 = none).
-
-    Any other keyword arguments are accepted and ignored, with a printed
-    warning -- a safety net so a new experimental kwarg doesn't raise
-    TypeError, but NOT a substitute for actually wiring up a kwarg you
-    intend to have an effect. If the warning fires unexpectedly, that's a
-    bug to fix here, not something to silence.
+    input_size, debug -- see the individual block classes above.
     """
 
     def __init__(
@@ -517,23 +337,7 @@ class ACORN(nn.Module):
         output_size: Optional[Tuple[int, int]] = None,
         input_size: Optional[Tuple[int, int]] = None,
         debug: bool = True,
-        # ── RFF position encoding ──────────────────────────────────────────
-        use_rff_position: bool = False,
-        rff_num_frequencies: int = 32,
-        rff_freq_scale_lat: float = 5.0,
-        rff_freq_scale_mlt: float = 5.0,
-        rff_mlat_span_deg: float = 50.0,
-        rff_n_mlt: int = 24,
-        rff_wrap_front_source_idx: int = -1,
-        rff_seed: int = 0,
-        rff_include_mlt_harmonics: bool = False,
-        rff_max_mlt_harmonic: int = 4,
-        # ── sham/noise control ──────────────────────────────────────────────
-        use_sham_position: bool = False,
-        sham_num_channels: Optional[int] = None,
-        sham_seed: int = 999,
         # ── conv refinement head ─────────────────────────────────────────────
-        use_conv_head: bool = True,
         conv_head_hidden_channels: int = 32,
         conv_head_num_layers: int = 2,
         conv_head_dropout: float = 0.0,
@@ -541,6 +345,18 @@ class ACORN(nn.Module):
         **extra_kwargs,
     ):
         super().__init__()
+
+        # Keys from architecture options that no longer exist. Absorbing
+        # these into extra_kwargs would print a soft warning and then
+        # build the default anyway, so a config still requesting one
+        # would silently get something else. Raise instead.
+        removed_keys = sorted(k for k in extra_kwargs if k in REMOVED_KWARGS)
+        if removed_keys:
+            raise TypeError(
+                f"{removed_keys} are no longer parameters of ACORN. Remove "
+                "them from model_config. A checkpoint trained with one of "
+                "these needs retraining or an older revision of this file."
+            )
 
         if extra_kwargs:
             print(
@@ -565,23 +381,11 @@ class ACORN(nn.Module):
             raise ValueError(f"dropout_rate={dropout_rate} must be in [0, 1).")
         if dropout_depth < 0 or dropout_depth > depth:
             raise ValueError(f"dropout_depth={dropout_depth} must be in [0, depth={depth}].")
-        if use_rff_position and output_size is None:
-            raise ValueError("use_rff_position=True requires output_size to be set.")
-        if use_sham_position and output_size is None:
-            raise ValueError("use_sham_position=True requires output_size to be set.")
-        if use_rff_position and use_sham_position:
-            raise ValueError(
-                "use_rff_position and use_sham_position are mutually exclusive -- "
-                "the sham control is meant to replace RFF, not combine with it."
-            )
 
         self.output_size = output_size
         self.depth = depth
         self.use_cbam = use_cbam
         self.use_attention_gates = use_attention_gates
-        self.use_rff_position = use_rff_position
-        self.use_sham_position = use_sham_position
-        self.use_conv_head = use_conv_head
 
         # ── Channel progression ──────────────────────────────────────────────
         enc_channels: List[int] = [max(1, round(base_channels * (channel_mult ** i))) for i in range(depth)]
@@ -641,43 +445,17 @@ class ACORN(nn.Module):
             ))
             prev_channels = dec_out
 
-        # ── RFF position encoding / sham control + head ─────────────────────
-        if use_rff_position:
-            self.rff_position = RFFPositionEncoding(
-                grid_rows=output_size[0], grid_cols=output_size[1],
-                num_frequencies=rff_num_frequencies,
-                freq_scale_lat=rff_freq_scale_lat, freq_scale_mlt=rff_freq_scale_mlt,
-                mlat_span_deg=rff_mlat_span_deg, n_mlt=rff_n_mlt,
-                wrap_front_source_idx=rff_wrap_front_source_idx, seed=rff_seed,
-                include_mlt_harmonics=rff_include_mlt_harmonics,
-                max_mlt_harmonic=rff_max_mlt_harmonic,
-            )
-            self.sham_position = None
-            head_in_channels = enc_channels[0] + self.rff_position.out_channels
-        elif use_sham_position:
-            self.rff_position = None
-            n_sham = sham_num_channels if sham_num_channels is not None else 2 * rff_num_frequencies
-            self.sham_position = NoisePositionEncoding(
-                grid_rows=output_size[0], grid_cols=output_size[1],
-                out_channels=n_sham, seed=sham_seed,
-            )
-            head_in_channels = enc_channels[0] + self.sham_position.out_channels
-        else:
-            self.rff_position = None
-            self.sham_position = None
-            head_in_channels = enc_channels[0]
+        # ── Refinement head ────────────────────────────────────────────────
+        head_in_channels = enc_channels[0]
 
-        self.head = (
-            ConvRefinementHead(
-                head_in_channels, out_channels,
-                hidden_channels=conv_head_hidden_channels, num_layers=conv_head_num_layers,
-                dropout_rate=conv_head_dropout,
-            )
-            if use_conv_head else
-            nn.Conv2d(head_in_channels, out_channels, kernel_size=1)
+        self.head = ConvRefinementHead(
+            head_in_channels, out_channels,
+            hidden_channels=conv_head_hidden_channels,
+            num_layers=conv_head_num_layers,
+            dropout_rate=conv_head_dropout,
         )
-        self._conv_head_hidden_channels = conv_head_hidden_channels
-        self._conv_head_num_layers = conv_head_num_layers
+        self.conv_head_hidden_channels = conv_head_hidden_channels
+        self.conv_head_num_layers = conv_head_num_layers
 
         if debug:
             print(self.summary())
@@ -712,13 +490,6 @@ class ACORN(nn.Module):
         if self.output_size is not None:
             x = F.interpolate(x, size=self.output_size, mode="bilinear", align_corners=False)
 
-        if self.use_rff_position:
-            pos = self.rff_position(x.shape[0])
-            x = torch.cat([x, pos], dim=1)
-        elif self.use_sham_position:
-            pos = self.sham_position(x.shape[0])
-            x = torch.cat([x, pos], dim=1)
-
         x = self.head(x)
         return x
 
@@ -738,15 +509,12 @@ class ACORN(nn.Module):
             attn_str.append("AttentionGates")
         attn_label = " + ".join(attn_str) if attn_str else "none"
 
-        rff_label = f"RFF({self.rff_position.out_channels}ch)" if self.use_rff_position else \
-                    f"SHAM({self.sham_position.out_channels}ch)" if self.use_sham_position else "none"
-
-        head_label = (f"ConvRefinementHead({self._conv_head_num_layers}L, "
-                      f"{self._conv_head_hidden_channels}ch)" if self.use_conv_head else "1x1")
+        head_label = (f"ConvRefinementHead({self.conv_head_num_layers}L, "
+                      f"{self.conv_head_hidden_channels}ch)")
 
         lines = [
             "-" * 52,
-            f"  ACORN-Net  |  attention: {attn_label}  |  position: {rff_label}  |  head: {head_label}",
+            f"  ACORN-Net  |  attention: {attn_label}  |  head: {head_label}",
             "-" * 52,
             (f"  in -> stem({enc_ch[0]}) -> "
              + " -> ".join(f"enc{i+1}({c})" for i, c in enumerate(enc_ch))

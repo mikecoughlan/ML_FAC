@@ -3,7 +3,7 @@
 # inference.py
 #
 # Inference wrapper for the ACORN field-aligned current model.
-# Model architecture (ACORN, incl. optional RFF/sham/conv-head) lives in
+# Model architecture (ACORN, including the refinement head) lives in
 # model_classes.py, imported below -- this file needs model_classes.py
 # importable alongside it. Everything else (data loading, preprocessing,
 # scaling) is handled here.
@@ -22,7 +22,6 @@
 #   realtime=True            : live NOAA SWPC feed (last 24 h only)
 # Data is fetched fresh on every predict() call.
 #
-# TODO: remove debugging print statements from _build_sequences
 #       and _run_model once inference is stable.
 #
 ####################################################################################
@@ -31,8 +30,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import math
-import os
 import pickle
 import platform
 import sys
@@ -46,11 +43,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-os.environ["CDF_LIB"] = "~/CDF/lib"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -75,14 +70,13 @@ def _resolve_data_dir(config: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Model architecture  (imported from model_classes.py -- single source of truth;
-# RFF position encoding, the sham control, and the conv refinement head are all
-# optional kwargs on ACORN itself now, gated by use_rff_position /
-# use_sham_position / use_conv_head in the config's model_config block. No
-# architecture-selection branching needed here -- same ACORN(**model_config)
-# call regardless of which of those flags (if any) are set.)
+# Model architecture  (imported from model_classes.py -- single source of
+# truth. ACORN builds itself from model_config alone, so no
+# architecture-selection branching is needed here: the same
+# ACORN(**model_config) call serves every checkpoint.)
 # ══════════════════════════════════════════════════════════════════════════════
 sys.path.append(".")
+import utils
 from model_classes import ACORN
 
 
@@ -179,7 +173,6 @@ def _load_solarwind_realtime(config: dict, vars_to_keep: Optional[List[str]] = N
     """
     if vars_to_keep is None:
         vars_to_keep = config["input_params"]
-    storm_param = config.get("storm_extract_param", "SME")
 
     solarwind = _fetch_noaa_realtime()
     if solarwind is None:
@@ -225,7 +218,6 @@ def _load_solarwind_realtime(config: dict, vars_to_keep: Optional[List[str]] = N
         print(f"Warning: real-time feed is missing columns {missing}. "
               "Predictions may be unreliable.")
     solarwind = solarwind[available]
-    solarwind.drop(columns=[storm_param], errors="ignore", inplace=True)
     solarwind.dropna(inplace=True)
 
     return solarwind
@@ -245,8 +237,21 @@ _OMNI_COL_MAP = {
     "AL_INDEX":       "SML",
 }
 
-# Fill values used in OMNI CDFs for each variable (from omnitxtcdf.py metadata)
-_OMNI_FILLVALS = {
+# Fill values used in OMNI CDFs for each variable (from omnitxtcdf.py metadata).
+#
+# Any variable absent from this table falls back to OMNI_FILLVAL_DEFAULT
+# below. That default is NaN, meaning "no fill value is known for this
+# variable" -- the comparison against NaN is always False, so nothing is
+# masked and the raw values pass through untouched. This is deliberate:
+# guessing a sentinel for an unknown variable risks silently deleting
+# real measurements that happen to be large, which is a worse failure
+# than leaving a fill value in place where it can still be spotted.
+#
+# Preferred fix for a missing entry is to add it here rather than to
+# lean on the default. Note processing_omni.py takes the other approach
+# for bulk processing, reading FILLVAL from each variable's own CDF
+# attributes.
+OMNI_FILLVALS = {
     "Vx":             99999.9,
     "BX_GSE":         9999.99,
     "BY_GSM":         9999.99,
@@ -257,6 +262,9 @@ _OMNI_FILLVALS = {
     "AU_INDEX":       99999.0,
     "AL_INDEX":       99999.0,
 }
+
+# Sentinel meaning "unknown fill value"; see the note above.
+OMNI_FILLVAL_DEFAULT = np.nan
 
 _OMNI_CACHE_DIR = Path.home() / ".cache" / "omni_cdfs"
 _OMNI_BASE_URL  = "https://spdf.gsfc.nasa.gov/pub/data/omni/omni_cdaweb/hro_1min"
@@ -341,8 +349,11 @@ def _read_omni_cdf(cdf_path: Path, startdt: datetime.datetime,
             vals = np.array(cdf[omni_name], dtype=float)[mask]
         except Exception:
             vals = np.full(mask.sum(), np.nan)
-        # Replace fill values with NaN
-        fill = _OMNI_FILLVALS.get(omni_name, 99999.0)
+        # Replace fill values with NaN. The 0.99 factor catches values
+        # that sit just below the declared sentinel through rounding or
+        # unit conversion. If no fill value is known the threshold is
+        # NaN, the comparison is uniformly False, and nothing is masked.
+        fill = OMNI_FILLVALS.get(omni_name, OMNI_FILLVAL_DEFAULT)
         vals[np.abs(vals) >= np.abs(fill) * 0.99] = np.nan
         data[col_name] = vals
 
@@ -367,7 +378,6 @@ def _load_solarwind_omni(config: dict, startdt: datetime.datetime,
     """
     if vars_to_keep is None:
         vars_to_keep = config["input_params"]
-    storm_param = config.get("storm_extract_param", "SME")
 
     # Collect all months that span [startdt, enddt]
     months, cur = [], datetime.datetime(startdt.year, startdt.month, 1)
@@ -404,7 +414,7 @@ def _load_solarwind_omni(config: dict, startdt: datetime.datetime,
             f"Errors:\n{error_detail}"
         )
     if errors:
-        print(f"Warning: some months could not be fetched:\n" + "\n".join(errors))
+        print("Warning: some months could not be fetched:\n" + "\n".join(errors))
 
     solarwind = pd.concat(frames).sort_index()
     solarwind = solarwind[~solarwind.index.duplicated(keep="first")]
@@ -430,7 +440,6 @@ def _load_solarwind_omni(config: dict, startdt: datetime.datetime,
     if missing:
         print(f"Warning: OMNI fetch is missing columns {missing}.")
     solarwind = solarwind[available]
-    solarwind.drop(columns=[storm_param], errors="ignore", inplace=True)
     solarwind.dropna(inplace=True)
 
     return solarwind
@@ -452,12 +461,12 @@ class FACInference:
     ----------
     config_path : str
         Path to the consolidated config.json (global params + per-target
-        sci/opp blocks).
+        sci/op blocks).
     model_variant : str, optional
-        Which model ("sci" or "opp") to use. Defaults to whatever
+        Which model ("sci" or "op") to use. Defaults to whatever
         config.json's "active_model" says. Pass this explicitly when you
-        need both sci and opp in the same script/session (e.g. building
-        acorn_results and opp_results side by side) -- config.json's
+        need both sci and op in the same script/session (e.g. building
+        acorn_results and op_results side by side) -- config.json's
         active_model is a single global default, not something you'd want
         to mutate per-call.
     model_path : str, optional
@@ -479,12 +488,10 @@ class FACInference:
     --------------------
     model_config : dict
         Whatever's in this block flows straight into ACORN(**model_config).
-        RFF position encoding, the sham control, and the conv refinement
-        head are all optional -- add use_rff_position / use_sham_position /
-        use_conv_head (plus their respective settings) to turn them on;
-        omit them for the original 1x1-head, no-position behavior. No
-        separate architecture-selection key needed -- ACORN figures out
-        what to build from model_config alone.
+        Attention is switchable via use_cbam / use_attention_gates; the
+        refinement head is always built. No separate
+        architecture-selection key needed -- ACORN figures out what to
+        build from model_config alone.
 
     Examples
     --------
@@ -493,7 +500,7 @@ class FACInference:
 
     # Explicit model -- both usable in the same script without touching the file
     sci_wrapper = FACInference("config.json", model_variant="sci")
-    opp_wrapper = FACInference("config.json", model_variant="opp")
+    op_wrapper = FACInference("config.json", model_variant="op")
 
     # Single timestamp -> arrays of shape (H, W)
     mean, std = wrapper.predict(timestamp="2023-05-06 05:00:00")
@@ -508,25 +515,23 @@ class FACInference:
     # Conv-head model -- pass model_path explicitly, since experimental
     # checkpoint filenames don't follow this file's default naming derivation
     wrapper = FACInference("config.json", model_variant="sci",
-                           model_path="models/FAC_ACORN_sci_overlap_next_baseline_scratch_convhead_full_retrain.pt")
+                           model_path="models/acorn_sci.pt")
     """
 
     def __init__(
         self,
         config_path:     str           = "config.json",
-        model_variant:   Optional[str] = None,   # override config.json's active_model -- "sci" or "opp"
+        model_variant:   Optional[str] = None,   # override config.json's active_model -- "sci" or "op"
         model_path:      Optional[str] = None,
         lookback_limit:  int           = 10,
         realtime:        bool          = False,
     ):
-        with open(config_path, "r") as f:
-            _raw_config = json.load(f)
-        active_model = model_variant if model_variant is not None else _raw_config["active_model"]
-        self.config = _resolve_data_dir({**_raw_config["global"], **_raw_config[active_model]})
-        self._model_variant = active_model
+        # utils.load_config performs the shared/per-model merge and
+        # validates the model name, so inference and training resolve
+        # configuration identically.
+        self.config = _resolve_data_dir(utils.load_config(model_variant, config_path))
+        self._model_variant = self.config["model_name"]
 
-        self._eras         = self.config.get("eras", "next")
-        self._data_version = self.config["data_version"]
         self._time_history = self.config.get("time_history", 60)
         self._ampere_delay = self.config.get("ampere_delay", 0)
         self._here         = Path(config_path).resolve().parent
@@ -536,20 +541,13 @@ class FACInference:
         if model_path is not None:
             self._model_path = Path(model_path)
         else:
-            self._model_path = (
-                self._here
-                / self.config.get("model_dir", "models/")
-                / f'{self.config["model"]}_{self.config["version"]}_{self._eras}.pt'
-            )
+            # Canonical name from utils, so training and inference cannot
+            # disagree about where the weights live.
+            self._model_path = self._here / utils.model_file(self.config)
             print(f'MODEL PATH: {self._model_path}')
 
         # ── Scaler ────────────────────────────────────────────────────────────
-        scaler_path = (
-            self._here
-            / self.config.get("model_dir", "models/")
-            / "scalers"
-            / f"scaler_{self._eras}_{self._data_version}.pkl"
-        )
+        scaler_path = self._here / utils.scaler_file(self.config)
         print(f'SCALER PATH: {scaler_path}')
         if not scaler_path.exists():
             raise FileNotFoundError(
@@ -823,7 +821,8 @@ class FACInference:
 
         if not windows:
             print(
-                f"[_build_sequences] No sequences built from {len(timestamps)} timestamp(s):\n"
+                f"No input sequences could be built from {len(timestamps)} timestamp(s). "
+                "Breakdown of why each was skipped:\n"
                 f"  Not found in SW index : {n_not_in_index}\n"
                 f"  Negative end_pos      : {n_bad_end_pos}\n"
                 f"  Hit lookback_limit    : {n_lookback_limit}\n"
@@ -833,11 +832,6 @@ class FACInference:
             )
             return np.empty(0), []
 
-        print(f"[_build_sequences] Built {len(windows)} sequence(s) from "
-              f"{len(timestamps)} timestamp(s) "
-              f"(skipped: not_in_index={n_not_in_index}, "
-              f"lookback_limit={n_lookback_limit}, "
-              f"insufficient={n_insufficient})")
 
         sequences = np.stack(windows, axis=0)           # (N, T, F)
         N, T, F   = sequences.shape
@@ -862,15 +856,12 @@ class FACInference:
         std  : np.ndarray  shape (N, H, W)
         """
         X = torch.tensor(sequences, dtype=torch.float32).unsqueeze(1)  # (N, 1, T, F)
-        print(f"[_run_model] input shape : {tuple(X.shape)}")
 
         self._model.eval()
         self._model.to(DEVICE)
 
         with torch.no_grad():
             output = self._model(X.to(DEVICE))
-            print(f"[_run_model] raw output shape : {tuple(output.shape)}")
-            print(f"[_run_model] raw output min/max: {output.min().item():.4f} / {output.max().item():.4f}")
             output = output.cpu().numpy()
 
         if output.ndim == 3:
@@ -883,16 +874,10 @@ class FACInference:
             mean = output[:, 0, :, :]
             std  = output[:, 1, :, :]
 
-        print(f"[_run_model] mean shape: {mean.shape}  min/max: {mean.min():.4f} / {mean.max():.4f}")
-        print(f"[_run_model] std  shape: {std.shape}   min/max: {std.min():.4f} / {std.max():.4f}")
 
         return mean, std
 
-    def load_ampere(
-        self,
-        timestamp: str,
-        ampere_version: Optional[str] = None,
-    ) -> Optional[np.ndarray]:
+    def load_ampere(self, timestamp: str) -> Optional[np.ndarray]:
         """
         Load the AMPERE observed current density for a given timestamp from
         the pre-computed pickle files in ampere_data/ (sibling of models/).
@@ -901,21 +886,16 @@ class FACInference:
         ----------
         timestamp : str
             Timestamp string in "YYYY-MM-DD HH:MM:SS" format.
-        ampere_version : str, optional
-            Override the ampere_version from config (e.g. "0_1"). Defaults to
-            config["ampere_version"].
-
         Returns
         -------
         np.ndarray or None
             2D array of shape (lat, MLT) for the requested timestamp, or None
             if the timestamp is not found in the pickle files.
         """
-        version    = '0_0'
         ampere_dir = self._here / "ampere_data"
 
         # Search all available pickle files regardless of era
-        candidates = sorted(ampere_dir.glob(f"ampere_*_{version}.pkl"))
+        candidates = sorted(ampere_dir.glob("ampere*.pkl"))
         if not candidates:
             print(f"No AMPERE pickle files found in {ampere_dir}.")
             return None
@@ -951,11 +931,9 @@ class FACInference:
     def _load_model(self) -> nn.Module:
         """Load ACORN weights from checkpoint using model_config from config.json.
 
-        ACORN itself now handles RFF / sham / conv-head selection internally,
-        based on whatever's in model_config (use_rff_position, use_sham_position,
-        use_conv_head, etc. -- all default off, matching original behavior).
-        Nothing here needs to branch on architecture anymore -- same
-        ACORN(**model_config) call regardless of which checkpoint this is.
+        ACORN builds itself from model_config, so nothing here needs to
+        branch on architecture -- the same ACORN(**model_config) call
+        serves every checkpoint.
         """
         if not Path(self._model_path).exists():
             raise FileNotFoundError(
@@ -1006,7 +984,7 @@ class TFACInference:
     Parameters
     ----------
     config_path : str
-        Path to config.json (used for shared settings: eras, time_history, etc.)
+        Path to config.json (used for shared settings: time_history, etc.)
     model_path : str, optional
         Path to the .hdf5 model file. Defaults to models/FAC_onlySW.hdf5
         in the same directory as config.json.
@@ -1021,7 +999,7 @@ class TFACInference:
 
     def __init__(
         self,
-        model_type:     str           = 'opp',
+        model_type:     str           = 'op',
         config_path:    str           = "config.json",
         model_path:     Optional[str] = None,
         norm_path:      Optional[str] = None,
@@ -1029,10 +1007,10 @@ class TFACInference:
         realtime:       bool          = False,
     ):
 
-        with open(f'{model_type}_{config_path}', "r") as f:
-            self.config = json.load(f)
+        # Same merged config as the PyTorch wrapper; model_type selects
+        # which block ('sci' or 'op'), rather than naming a separate file.
+        self.config = utils.load_config(model_type, config_path)
 
-        self._eras          = self.config.get("eras", "next")
         self._time_history  = self.config.get("time_history", 60)
         self._ampere_delay  = self.config.get("ampere_delay", 0)
         self._lookback_limit = lookback_limit
@@ -1468,7 +1446,7 @@ if __name__ == "__main__":
     realtime=True
 
     # ── ACORN (PyTorch) ───────────────────────────────────────────────────────
-    acorn = FACInference("opp_config.json", realtime=realtime)
+    acorn = FACInference("config.json", model_variant="op", realtime=realtime)
     acorn_mean, std, time = acorn.predict(timestamp=TS)
     print(f"ACORN Single mean: {acorn_mean.shape}  std: {std.shape}")
 
@@ -1479,7 +1457,7 @@ if __name__ == "__main__":
     # print(f"[ACORN Date range] mean: {mean.shape}  std: {std.shape}")
 
     # ── TF model (Keras) ──────────────────────────────────────────────────────
-    tf_model = TFACInference("opp_config.json", realtime=realtime)
+    tf_model = TFACInference("config.json", model_variant="op", realtime=realtime)
     bk_mean, _, time = tf_model.predict(timestamp=TS)
     print(f"TF Single mean: {bk_mean.shape}  std: None")
 

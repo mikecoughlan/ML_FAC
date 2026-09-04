@@ -1,0 +1,128 @@
+{
+	"_comment": [
+		"Single configuration file for ACORN. Select a model with the string",
+		"'sci' or 'op' -- nothing here needs editing for normal use.",
+		"",
+		"'shared' holds every setting common to both models. 'sci' and 'op'",
+		"hold only the keys that differ. A model's effective config",
+		"is shared updated with its own block, so a model block may override",
+		"any shared key.",
+		"",
+		"Load it with utils.load_config('sci') or utils.load_config('op')."
+	],
+	"active_model": "sci",
+	"shared": {
+		"model": "FAC",
+		"random_seed": 42,
+		"data_dir": "../../data/",
+		"model_dir": "models/",
+		"results_dir": "results/",
+		"outputs_dir": "outputs/",
+		"plot_dir": "plots/",
+		"ampere_delay": 0,
+		"time_history": 60,
+		"output_size": [
+			50,
+			24
+		],
+		"shuffling_split_data": true,
+		"loss": "weighted_crps",
+		"learning_rate": 1e-06,
+		"epochs": 500,
+		"batch_size": 64,
+		"early_stop_patience": 25,
+		"specific_test_storms": [
+			"2023-01-04 09:00:00",
+			"2023-05-06 05:00:00"
+		]
+	},
+	"sci": {
+		"version": "ACORN_Sci",
+		"input_params": [
+			"Vx",
+			"BX_GSE",
+			"BY_GSM",
+			"BZ_GSM",
+			"proton_density",
+			"sin_month",
+			"cos_month",
+			"F107",
+			"SML",
+			"SMU",
+			"SYM_H",
+			"ASY_H"
+		],
+		"bk_input_params": [
+			"Bz",
+			"By",
+			"Bx",
+			"Vx",
+			"Np",
+			"SMU",
+			"SML",
+			"SYM_H",
+			"ASY_H",
+			"F107",
+			"month_sine",
+			"month_cosine"
+		],
+		"model_config": {
+			"in_channels": 1,
+			"out_channels": 2,
+			"base_channels": 64,
+			"depth": 2,
+			"num_res_blocks": 3,
+			"layers_per_block": 3,
+			"channel_mult": 2.0,
+			"cbam_reduction": 8,
+			"dropout_rate": 0.3,
+			"dropout_depth": 0,
+			"debug": false,
+			"use_cbam": true,
+			"use_attention_gates": true,
+			"conv_head_hidden_channels": 32,
+			"conv_head_num_layers": 2,
+			"conv_head_dropout": 0.0
+		}
+	},
+	"op": {
+		"version": "ACORN_Op",
+		"input_params": [
+			"Vx",
+			"BX_GSE",
+			"BY_GSM",
+			"BZ_GSM",
+			"proton_density",
+			"sin_month",
+			"cos_month",
+			"F107"
+		],
+		"bk_input_params": [
+			"Bz",
+			"By",
+			"Bx",
+			"Vx",
+			"Np",
+			"month_sine",
+			"month_cosine"
+		],
+		"model_config": {
+			"in_channels": 1,
+			"out_channels": 2,
+			"base_channels": 64,
+			"depth": 2,
+			"num_res_blocks": 2,
+			"layers_per_block": 2,
+			"channel_mult": 2.0,
+			"cbam_reduction": 8,
+			"dropout_rate": 0.3,
+			"dropout_depth": 0,
+			"debug": false,
+			"use_cbam": true,
+			"use_attention_gates": true,
+			"conv_head_hidden_channels": 32,
+			"conv_head_num_layers": 2,
+			"conv_head_dropout": 0.0
+		}
+	}
+}
