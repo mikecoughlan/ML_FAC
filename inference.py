@@ -22,6 +22,12 @@
 #   realtime=True            : live NOAA SWPC feed (last 24 h only)
 # Data is fetched fresh on every predict() call.
 #
+#   SML / SMU / SME          : SuperMAG web service (requires supermag-api
+#                              and a registered userid; set SUPERMAG_USERID).
+#                              These match training. OMNI's AU_INDEX /
+#                              AL_INDEX are a DIFFERENT index family and are
+#                              only used when allow_ae_substitution=True.
+#
 #       and _run_model once inference is stable.
 #
 ####################################################################################
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import pickle
 import platform
 import sys
@@ -45,7 +52,6 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
-
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -78,7 +84,6 @@ def _resolve_data_dir(config: dict) -> dict:
 sys.path.append(".")
 import utils
 from model_classes import ACORN
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Solar wind loading  (inference-only subset of data_prep.PreparingData)
@@ -117,39 +122,277 @@ def _fetch_f107() -> float:
         return 150.0
 
 
+def _fill_and_validate(solarwind: pd.DataFrame,
+                       vars_to_keep: List[str],
+                       model_name: str = "",
+                       gap_limit_minutes: int = 15) -> pd.DataFrame:
+    """
+    Fill short gaps in the model inputs, and refuse to proceed when an input
+    is wholly absent.
+
+    Distinguishes two cases, because they mean different things:
+
+      * A required column that is entirely missing or entirely NaN means the
+        data source cannot supply it at all -- e.g. SYM_H/ASY_H have no
+        real-time source. Interpolating that is not a gap fill, it is
+        invention, so this raises and points at the operational model, which
+        is defined precisely to exclude these inputs.
+
+      * A column that is present but patchy has real measurements either side
+        of the gap, so gaps up to gap_limit_minutes are interpolated. Leading
+        and trailing gaps are back/forward filled under the same limit, since
+        there is only one side to interpolate from.
+
+    The limit matters: an unbounded ffill/bfill would propagate a single
+    value across hours and present it to the model as measurement.
+    """
+    present = [c for c in vars_to_keep if c in solarwind.columns]
+    absent  = [c for c in vars_to_keep if c not in solarwind.columns]
+    empty   = [c for c in present if solarwind[c].isna().all()]
+
+    unavailable = absent + empty
+    if unavailable:
+        raise RuntimeError(
+            f"Required model input(s) {unavailable} are entirely unavailable "
+            f"from this data source"
+            f"{f' for {model_name}' if model_name else ''}.\n"
+            f"These cannot be interpolated -- there are no values to "
+            f"interpolate between.\n"
+            f"If this is a real-time window, use the operational ('op') model, "
+            f"which excludes inputs that have no real-time source."
+        )
+
+    # Cadence-aware limit: the frames are 1-min, but derive it rather than
+    # assume so a resampled frame does not get a silently wrong window.
+    step = solarwind.index.to_series().diff().median()
+    if pd.isna(step) or step <= pd.Timedelta(0):
+        limit = gap_limit_minutes
+    else:
+        limit = max(1, int(round(pd.Timedelta(minutes=gap_limit_minutes) / step)))
+
+    before = {c: int(solarwind[c].isna().sum()) for c in present}
+
+    solarwind[present] = (solarwind[present]
+                          .interpolate(method="time", limit=limit,
+                                       limit_area="inside")
+                          .ffill(limit=limit)
+                          .bfill(limit=limit))
+
+    filled = {c: before[c] - int(solarwind[c].isna().sum())
+              for c in present if before[c]}
+    if filled:
+        print(f"Gap-filled (<= {gap_limit_minutes} min): "
+              + ", ".join(f"{c}: {n}" for c, n in filled.items() if n))
+
+    remaining = {c: int(solarwind[c].isna().sum())
+                 for c in present if solarwind[c].isna().any()}
+    if remaining:
+        print(f"Gaps longer than {gap_limit_minutes} min remain and those rows "
+              f"will be dropped: "
+              + ", ".join(f"{c}: {n}" for c, n in remaining.items()))
+
+    return solarwind
+
+
+def _enforce_vx_sign(solarwind: pd.DataFrame, source: str = "") -> pd.DataFrame:
+    """
+    Force Vx to the OMNI sign convention: negative (anti-sunward flow).
+
+    Training data comes from the OMNI feather, where Vx is already negative,
+    and the scaler was fit on that. The NOAA RTSW feed reports proton_speed
+    as a positive magnitude, so a sign flip there would place the input on
+    the opposite side of the scaler's mean and silently corrupt every
+    prediction. Rather than trusting each source's convention, the sign is
+    asserted here in one place.
+    """
+    if "Vx" not in solarwind.columns:
+        return solarwind
+
+    vx = pd.to_numeric(solarwind["Vx"], errors="coerce")
+    n_pos = int((vx > 0).sum())
+    n_val = int(vx.notna().sum())
+    if n_val == 0:
+        return solarwind
+
+    if n_pos:
+        if n_pos == n_val:
+            # Wholly positive: a speed magnitude, as the RTSW feed provides.
+            solarwind["Vx"] = -vx.abs()
+        else:
+            # Mixed signs are not a convention difference -- something is
+            # wrong upstream. Normalise, but say so rather than hiding it.
+            print(f"Warning: Vx{f' ({source})' if source else ''} has "
+                  f"{n_pos}/{n_val} positive values (mixed sign). Forcing all "
+                  f"to negative to match the OMNI convention used in training, "
+                  f"but the input source should be checked.")
+            solarwind["Vx"] = -vx.abs()
+        solarwind.attrs["vx_sign_corrected"] = True
+    else:
+        solarwind.attrs["vx_sign_corrected"] = False
+
+    return solarwind
+
+
+def _fetch_f107_series(startdt: datetime.datetime,
+                       enddt: datetime.datetime) -> Optional[pd.Series]:
+    """
+    Daily F10.7 for [startdt, enddt] from the DRAO fluxtable -- the same
+    source and column ('fluxadjflux', 1 AU adjusted) that data_prep.py uses
+    for training, daily mean, timestamped at 20:00.
+
+    Returns a date-indexed Series, or None if unavailable. Unlike
+    _fetch_f107() this varies with time, so a historical window gets the
+    F10.7 that actually applied rather than today's value.
+    """
+    import requests
+
+    url = ("https://www.spaceweather.gc.ca/solar_flux_data/"
+           "daily_flux_values/fluxtable.txt")
+    try:
+        txt = requests.get(url, timeout=60).text
+    except Exception as e:
+        print(f"Warning: DRAO fluxtable fetch failed ({e}).")
+        return None
+
+    lines = txt.splitlines()
+    try:
+        header = next(l for l in lines if "fluxdate" in l).split()
+    except StopIteration:
+        print("Warning: DRAO fluxtable has no recognisable header.")
+        return None
+
+    rows = [l.split() for l in lines
+            if l.split() and l.split()[0].isdigit() and len(l.split()[0]) == 8]
+    if not rows:
+        print("Warning: DRAO fluxtable returned no data rows.")
+        return None
+
+    df = pd.DataFrame(rows, columns=header[:len(rows[0])])
+    if "fluxadjflux" not in df.columns:
+        print(f"Warning: DRAO fluxtable has no 'fluxadjflux' column. "
+              f"Columns: {list(df.columns)}")
+        return None
+
+    df["F107"] = pd.to_numeric(df["fluxadjflux"], errors="coerce")
+    daily = df.groupby("fluxdate")["F107"].mean()
+    daily.index = (pd.to_datetime(daily.index, format="%Y%m%d")
+                   + datetime.timedelta(hours=20))
+    daily = daily.sort_index().dropna()
+
+    lo = pd.Timestamp(startdt) - pd.Timedelta(days=2)
+    hi = pd.Timestamp(enddt) + pd.Timedelta(days=2)
+    window = daily[(daily.index >= lo) & (daily.index <= hi)]
+    if window.empty:
+        print(f"Warning: DRAO fluxtable has no F10.7 for "
+              f"{startdt} -> {enddt}.")
+        return None
+    return window
+
+
+def _apply_f107(solarwind: pd.DataFrame,
+                startdt: Optional[datetime.datetime] = None,
+                enddt: Optional[datetime.datetime] = None) -> pd.DataFrame:
+    """
+    Populate solarwind['F107'] with a time-varying series where possible.
+
+    Falls back to the live NOAA scalar only when the historical table cannot
+    cover the window, and records which was used in .attrs['f107_source'].
+    A broadcast scalar over a historical window is wrong -- it feeds today's
+    solar activity to a past event -- so the series path is preferred.
+    """
+    if startdt is None:
+        startdt = solarwind.index.min().to_pydatetime()
+    if enddt is None:
+        enddt = solarwind.index.max().to_pydatetime()
+
+    series = _fetch_f107_series(startdt, enddt)
+    if series is not None:
+        s = series.reindex(
+            series.index.union(solarwind.index)
+        ).interpolate("time").reindex(solarwind.index)
+        s = s.ffill().bfill()
+        if s.notna().all():
+            solarwind["F107"] = s
+            solarwind.attrs["f107_source"] = "drao_adjusted"
+            return solarwind
+        print("Warning: DRAO F10.7 did not cover the whole window.")
+
+    scalar = _fetch_f107()
+    print(f"Warning: broadcasting a single F10.7 value ({scalar}) across "
+          f"{startdt} -> {enddt}. This is only appropriate for a near-real-"
+          f"time window; for historical windows it applies present-day solar "
+          f"activity to a past event.")
+    solarwind["F107"] = scalar
+    solarwind.attrs["f107_source"] = "noaa_scalar_broadcast"
+    return solarwind
+
+
 def _fetch_noaa_realtime() -> Optional[pd.DataFrame]:
     """
     Fetch the last 24 hours of real-time solar wind plasma and IMF data from
     NOAA SWPC. Returns a DatetimeIndex DataFrame with columns:
-        density, speed, bx_gsm, by_gsm, bz_gsm
+        density, speed, bx_gse, by_gsm, bz_gsm
     Returns None if the request fails.
+
+    Uses the RTSW endpoints that replaced the retired
+    products/solar-wind/*.json files. These serve one record per dict and
+    interleave several spacecraft (ACE, DSCOVR, SOLAR1, IMAP), so rows must
+    be filtered on the 'active' flag -- SWPC switches which spacecraft is
+    authoritative, and mixing them would splice discontinuous series.
     """
     try:
         print("Fetching real-time solar wind data from NOAA SWPC...")
 
-        plasma_url = "https://services.swpc.noaa.gov/products/solar-wind/plasma-1-day.json"
-        mag_url    = "https://services.swpc.noaa.gov/products/solar-wind/mag-1-day.json"
+        wind_url = "https://services.swpc.noaa.gov/json/rtsw/rtsw_wind_1m.json"
+        mag_url  = "https://services.swpc.noaa.gov/json/rtsw/rtsw_mag_1m.json"
 
-        plasma_json = json.loads(urlopen(plasma_url, timeout=10).read().decode("utf-8"))
-        mag_json    = json.loads(urlopen(mag_url,    timeout=10).read().decode("utf-8"))
+        wind = pd.DataFrame(json.loads(urlopen(wind_url, timeout=15).read().decode("utf-8")))
+        mag  = pd.DataFrame(json.loads(urlopen(mag_url,  timeout=15).read().decode("utf-8")))
 
-        plasma = pd.DataFrame(plasma_json[1:], columns=plasma_json[0])
-        mag    = pd.DataFrame(mag_json[1:],    columns=mag_json[0])
+        for name, df in (("wind", wind), ("mag", mag)):
+            if df.empty:
+                print(f"RTSW {name} feed returned no records.")
+                return None
+            if "active" not in df.columns:
+                print(f"RTSW {name} feed has no 'active' column. "
+                      f"Columns: {list(df.columns)}")
+                return None
 
-        plasma["Epoch"] = pd.to_datetime(plasma["time_tag"])
-        mag["Epoch"]    = pd.to_datetime(mag["time_tag"])
+        # Keep only the spacecraft SWPC currently designates as active.
+        wind = wind[wind["active"].astype(bool)]
+        mag  = mag[mag["active"].astype(bool)]
+        if wind.empty or mag.empty:
+            print("RTSW feeds contain no rows flagged active.")
+            return None
 
-        for col in ["density", "speed", "temperature"]:
-            plasma[col] = pd.to_numeric(plasma.get(col, np.nan), errors="coerce")
-        for col in ["bx_gsm", "by_gsm", "bz_gsm", "bt", "lon_gsm", "lat_gsm"]:
-            mag[col] = pd.to_numeric(mag.get(col, np.nan), errors="coerce")
+        srcs = (sorted(wind["source"].dropna().unique()),
+                sorted(mag["source"].dropna().unique()))
+        print(f"RTSW active source -- wind: {srcs[0]}, mag: {srcs[1]}")
 
-        combined = (
-            pd.merge(plasma, mag, on="Epoch", how="inner")
-            .set_index("Epoch")
-            .sort_index()
-            [["density", "speed", "bx_gsm", "by_gsm", "bz_gsm"]]
-        )
+        wind["Epoch"] = pd.to_datetime(wind["time_tag"])
+        mag["Epoch"]  = pd.to_datetime(mag["time_tag"])
+
+        for col in ["proton_density", "proton_speed", "proton_temperature"]:
+            wind[col] = pd.to_numeric(wind.get(col), errors="coerce")
+        for col in ["bx_gse", "by_gsm", "bz_gsm", "bt"]:
+            mag[col] = pd.to_numeric(mag.get(col), errors="coerce")
+
+        wind = (wind.dropna(subset=["Epoch"]).set_index("Epoch").sort_index()
+                [["proton_density", "proton_speed"]])
+        mag  = (mag.dropna(subset=["Epoch"]).set_index("Epoch").sort_index()
+                [["bx_gse", "by_gsm", "bz_gsm"]])
+        wind = wind[~wind.index.duplicated(keep="first")]
+        mag  = mag[~mag.index.duplicated(keep="first")]
+
+        combined = wind.join(mag, how="inner").rename(columns={
+            "proton_density": "density",
+            "proton_speed":   "speed",
+        })
+        combined = combined[["density", "speed", "bx_gse", "by_gsm", "bz_gsm"]]
+
+        if combined.empty:
+            print("RTSW wind and mag feeds share no common timestamps.")
+            return None
 
         print(f"Fetched {len(combined)} real-time data points "
               f"({combined.index.min()} -> {combined.index.max()})")
@@ -160,16 +403,19 @@ def _fetch_noaa_realtime() -> Optional[pd.DataFrame]:
         return None
 
 
-def _load_solarwind_realtime(config: dict, vars_to_keep: Optional[List[str]] = None) -> pd.DataFrame:
+def _load_solarwind_realtime(config: dict, vars_to_keep: Optional[List[str]] = None,
+                             supermag_userid: Optional[str] = None) -> pd.DataFrame:
     """
     Build the model input DataFrame from live NOAA SWPC feeds instead of
     Mirrors the column layout of _load_solarwind_omni() so the same
     scaler and sequence-building logic applies.
 
-    Note: SuperMAG indices (SML, SMU, SYM_H, ASY_H, SME) are not available
-    from NOAA in real time. They are filled with NaN and forward/back-filled
-    from whatever recent values exist; predictions will be degraded when these
-    indices are missing.
+    SML / SMU / SME are attempted from the SuperMAG web service first. Because
+    SuperMAG has its own processing lag, they are frequently unavailable for a
+    live window, in which case they are NaN-filled and predictions from the
+    sci model are degraded. SYM_H and ASY_H have no real-time source here and
+    are always NaN-filled. The source actually used is recorded in
+    .attrs['index_source'].
     """
     if vars_to_keep is None:
         vars_to_keep = config["input_params"]
@@ -190,41 +436,304 @@ def _load_solarwind_realtime(config: dict, vars_to_keep: Optional[List[str]] = N
     solarwind["sin_month"] = np.sin(months * 2 * np.pi / 12)
     solarwind["cos_month"] = np.cos(months * 2 * np.pi / 12)
 
-    # F10.7 — single scalar broadcast across the full index
-    solarwind["F107"] = _fetch_f107()
+    # F10.7 — time-varying where available; see _apply_f107.
+    solarwind = _apply_f107(solarwind)
 
     # Rename NOAA columns to match training feature names
+    # The RTSW mag feed carries bx_gse separately from bx_gsm, so BX_GSE is
+    # now filled with a true GSE component rather than the GSM one the
+    # retired feed forced us to use.
     solarwind = solarwind.rename(columns={
-        "bx_gsm":  "BX_GSE",
+        "bx_gse":  "BX_GSE",
         "by_gsm":  "BY_GSM",
         "bz_gsm":  "BZ_GSM",
         "speed":   "Vx",
         "density": "proton_density",
     })
 
+    # Vx from the RTSW feed is a positive speed magnitude; training used
+    # OMNI's negative convention.
+    solarwind = _enforce_vx_sign(solarwind, source="NOAA RTSW")
+
     # SuperMAG indices are unavailable in real time — insert NaN columns so
     # the DataFrame has the right shape, then interpolate what we can
+    # Try SuperMAG first. It carries its own processing lag, so for a live
+    # window this often returns nothing -- but when it does have data, using
+    # it is strictly better than the NaN stub below.
     supermag_cols = ["SML", "SMU", "SYM_H", "ASY_H", "SME"]
+    sm = _fetch_supermag_indices(solarwind.index.min().to_pydatetime(),
+                                 solarwind.index.max().to_pydatetime(),
+                                 userid=supermag_userid)
+    if sm is not None:
+        sm = sm.reindex(solarwind.index, method="nearest",
+                        tolerance=pd.Timedelta("1min"))
+        solarwind["SML"] = sm["SML"]
+        solarwind["SMU"] = sm["SMU"]
+        solarwind["SME"] = sm["SME"]
+        solarwind.attrs["index_source"] = "supermag"
+        print(f"SuperMAG SML/SMU/SME cover {sm['SML'].notna().mean():.1%} of "
+              f"the real-time window. Note this does not include SYM_H or "
+              f"ASY_H, which have no real-time source; the sci model needs "
+              f"them and will not run on this window.")
+    else:
+        needs_sm = any(c in vars_to_keep for c in ("SML", "SMU", "SME"))
+        if needs_sm:
+            print("SuperMAG indices unavailable for the real-time window "
+                  "(SuperMAG's processing lag exceeds 24 h). This model "
+                  "requires SML/SMU, so it cannot run on a live window -- "
+                  "use the operational ('op') model, which excludes them.")
+        else:
+            print("SuperMAG indices unavailable for the real-time window "
+                  "(processing lag exceeds 24 h). This model does not use "
+                  "them, so it is unaffected.")
+        solarwind.attrs["index_source"] = "unavailable"
+
     for col in supermag_cols:
         if col not in solarwind.columns:
             solarwind[col] = np.nan
 
-    solarwind = solarwind.interpolate(method="linear", limit=10).ffill().bfill()
+    # Fill short gaps; raise if an input has no real-time source at all.
+    solarwind = _fill_and_validate(
+        solarwind, vars_to_keep,
+        model_name=config.get("version", ""))
 
-    # Keep only the model input columns, drop storm param
-    available = [c for c in vars_to_keep if c in solarwind.columns]
-    missing   = [c for c in vars_to_keep if c not in solarwind.columns]
-    if missing:
-        print(f"Warning: real-time feed is missing columns {missing}. "
-              "Predictions may be unreliable.")
-    solarwind = solarwind[available]
+    solarwind = solarwind[vars_to_keep]
     solarwind.dropna(inplace=True)
+
+    if solarwind.empty:
+        raise RuntimeError(
+            "No complete rows remain after gap filling; every timestamp is "
+            "missing at least one model input.")
 
     return solarwind
 
 
-# OMNI variable names -> training feature names
-# AU_INDEX / AL_INDEX are the OMNI equivalents of SMU / SML
+# ══════════════════════════════════════════════════════════════════════════════
+# SuperMAG indices  (SML / SMU / SME)
+#
+# The model is trained on SuperMAG indices, not on the AE-ring AU/AL indices
+# carried by OMNI. These are different measurements, so the two are not
+# interchangeable and a substitution is recorded rather than assumed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Registered SuperMAG web-service user. Override with the SUPERMAG_USERID
+# environment variable, or by passing supermag_userid= to the loader.
+SUPERMAG_USERID = os.environ.get("SUPERMAG_USERID", "acorn_user")
+
+# Flag string for SuperMAGGetIndices. 'indicesall' returns the full index set;
+# 'all' additionally returns solar wind columns that are not needed here.
+SUPERMAG_FLAGS = "indicesall"
+
+
+def _fetch_supermag_indices(startdt: datetime.datetime,
+                            enddt: datetime.datetime,
+                            userid: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """
+    Fetch SML / SMU / SME from the SuperMAG web service for [startdt, enddt].
+
+    Returns a 1-min DataFrame indexed by UTC datetime with columns
+    SML, SMU, SME, or None if the indices could not be retrieved (package
+    missing, request failed, or the window falls outside SuperMAG coverage).
+
+    Returning None rather than raising lets the caller decide whether an
+    AE-index substitution is acceptable; it never silently substitutes here.
+    """
+    userid = userid or SUPERMAG_USERID
+    if not userid:
+        print("No SuperMAG userid configured; cannot fetch SML/SMU.")
+        return None
+
+    # The PyPI package ships as a directory with an empty __init__.py, so the
+    # callable lives in the supermag_api.supermag_api submodule rather than at
+    # the top level. Older/flat installs expose it directly; try both, then
+    # fall back to scanning submodules so a layout change does not silently
+    # disable SuperMAG and push everything onto the AE substitution.
+    SuperMAGGetIndices = None
+    try:
+        import supermag_api as _sm
+    except ImportError:
+        print("supermag_api not installed (pip install supermag-api); "
+              "cannot fetch SML/SMU.")
+        return None
+
+    SuperMAGGetIndices = getattr(_sm, "SuperMAGGetIndices", None)
+    if SuperMAGGetIndices is None:
+        import importlib
+        try:
+            _sub = importlib.import_module("supermag_api.supermag_api")
+            SuperMAGGetIndices = getattr(_sub, "SuperMAGGetIndices", None)
+        except ImportError:
+            pass
+    if SuperMAGGetIndices is None and hasattr(_sm, "__path__"):
+        import importlib
+        import pkgutil
+        for _m in pkgutil.iter_modules(_sm.__path__):
+            try:
+                _sub = importlib.import_module(f"supermag_api.{_m.name}")
+            except Exception:
+                continue
+            SuperMAGGetIndices = getattr(_sub, "SuperMAGGetIndices", None)
+            if SuperMAGGetIndices is not None:
+                break
+    if SuperMAGGetIndices is None:
+        print("supermag_api is installed but SuperMAGGetIndices was not found "
+              "in it or its submodules; check the package version.")
+        return None
+
+    start  = [startdt.year, startdt.month, startdt.day,
+              startdt.hour, startdt.minute, getattr(startdt, "second", 0)]
+    extent = int((enddt - startdt).total_seconds())
+    if extent <= 0:
+        return None
+
+    print(f"Fetching SuperMAG indices SML, SMU, SME "
+          f"(userid={userid}, flags={SUPERMAG_FLAGS!r}): "
+          f"{startdt:%Y-%m-%d %H:%M} -> {enddt:%Y-%m-%d %H:%M} "
+          f"({extent}s, {extent // 60} min expected)")
+
+    try:
+        status, sm_indices = SuperMAGGetIndices(
+            userid, start, extent, SUPERMAG_FLAGS, FORMAT="list")
+    except Exception as e:
+        print(f"SuperMAG request failed ({e}); SML/SMU unavailable.")
+        return None
+
+    # The client returns status 1 on success. Anything else is a failed or
+    # empty query -- including a window newer than SuperMAG has processed.
+    if status != 1 or sm_indices is None or len(sm_indices) == 0:
+        print(f"SuperMAG returned status {status} with "
+              f"{0 if sm_indices is None else len(sm_indices)} records; "
+              f"SML/SMU unavailable for {startdt} -> {enddt}.")
+        return None
+
+    # The response carries ~65 keys per record, several of which are lists
+    # (SMEr, SMLr, SMLrstid ... the per-MLT-sector breakdowns). Building a
+    # DataFrame from all of them gives ragged object columns, so pull only
+    # the scalar keys we need.
+    wanted = ("SML", "SMU", "SME")
+    missing = [k for k in ("tval",) + wanted if k not in sm_indices[0]]
+    if missing:
+        print(f"SuperMAG response is missing {missing}. "
+              f"Keys: {list(sm_indices[0].keys())[:10]}...")
+        return None
+
+    out = pd.DataFrame({
+        k: pd.to_numeric([rec.get(k) for rec in sm_indices], errors="coerce")
+        for k in wanted
+    }, index=pd.to_datetime([rec["tval"] for rec in sm_indices], unit="s"))
+
+    # SuperMAG marks missing data with a sentinel (999999) rather than null,
+    # so unmasked it reads as a valid measurement: coverage looks complete,
+    # gap filling is skipped, and the sentinel reaches the scaler as though it
+    # were a real index value. Mask on magnitude rather than equality, since
+    # variants (999999.0, 9999999) appear across products.
+    #
+    # The physical ranges are nowhere near the sentinel: SML/SMU rarely exceed
+    # a few thousand nT even in severe storms, so 100000 separates them
+    # cleanly without risking a real extreme value.
+    n_before = out.notna().sum()
+    out = out.mask(out.abs() >= 100000)
+    n_masked = n_before - out.notna().sum()
+    if n_masked.any():
+        print("Masked SuperMAG fill values: "
+              + ", ".join(f"{k}: {int(v)}" for k, v in n_masked.items() if v))
+
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+
+    valid = out[["SML", "SMU"]].notna().all(axis=1).mean()
+    print(f"SuperMAG returned {len(out)} records "
+          f"({out.index.min()} -> {out.index.max()}); "
+          f"{valid:.1%} have valid SML and SMU after fill masking "
+          f"(response carried {len(sm_indices[0])} keys per record)")
+
+    if out[["SML", "SMU"]].isna().all().any():
+        print("SuperMAG returned SML/SMU columns that are entirely NaN.")
+        return None
+
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+
+    return out
+
+
+def _promote_supermag_indices(solarwind: pd.DataFrame,
+                              startdt: datetime.datetime,
+                              enddt: datetime.datetime,
+                              allow_ae_substitution: bool = False,
+                              supermag_userid: Optional[str] = None) -> pd.DataFrame:
+    """
+    Populate SML / SMU / SME on `solarwind`, preferring SuperMAG.
+
+    If SuperMAG is unavailable and allow_ae_substitution is True, OMNI's
+    AL_INDEX / AU_INDEX are used instead and the frame is tagged
+    solarwind.attrs['index_source'] = 'ae_substituted'. If it is False
+    (the default) the call raises rather than quietly degrading.
+
+    The AE substitution is a real change of quantity, not a rename -- see the
+    note on _OMNI_COL_MAP.
+    """
+    sm = _fetch_supermag_indices(startdt, enddt, userid=supermag_userid)
+
+    if sm is not None:
+        sm = sm.reindex(solarwind.index, method="nearest",
+                        tolerance=pd.Timedelta("1min"))
+        coverage = sm["SML"].notna().mean()
+        solarwind["SML"] = sm["SML"]
+        solarwind["SMU"] = sm["SMU"]
+        solarwind["SME"] = sm["SME"]
+        solarwind.attrs["index_source"] = "supermag"
+        solarwind.attrs["index_coverage"] = float(coverage)
+        if coverage < 0.99:
+            print(f"Note: SuperMAG SML/SMU/SME cover {coverage:.1%} of the "
+                  f"requested timestamps; the remainder is NaN.")
+        return solarwind
+
+    have_ae = {"AL_INDEX", "AU_INDEX"}.issubset(solarwind.columns)
+    if not allow_ae_substitution:
+        raise RuntimeError(
+            "SML/SMU could not be retrieved from SuperMAG, and AE substitution "
+            "is disabled.\n"
+            "  - Check SUPERMAG_USERID and that supermag-api is installed.\n"
+            "  - SuperMAG has its own processing lag; very recent windows may "
+            "not be available yet.\n"
+            "  - To accept degraded indices, pass allow_ae_substitution=True. "
+            "AL/AU are a different index family and will bias predictions, "
+            "most strongly during active periods."
+        )
+
+    if not have_ae:
+        raise RuntimeError(
+            "SML/SMU unavailable from SuperMAG and OMNI AL_INDEX/AU_INDEX are "
+            "also absent; cannot populate the SuperMAG inputs."
+        )
+
+    print("WARNING: substituting OMNI AL_INDEX/AU_INDEX for SML/SMU. "
+          "These come from a 12-station ring rather than SuperMAG's ~100+ "
+          "station network, are systematically smaller in magnitude, and "
+          "diverge most during active periods. Predictions will be biased "
+          "relative to the training distribution.")
+    solarwind["SML"] = solarwind["AL_INDEX"]
+    solarwind["SMU"] = solarwind["AU_INDEX"]
+    solarwind["SME"] = solarwind["SMU"] - solarwind["SML"]
+    solarwind.attrs["index_source"] = "ae_substituted"
+    solarwind.attrs["index_coverage"] = float(solarwind["SML"].notna().mean())
+    return solarwind
+
+
+# OMNI variable names -> training feature names.
+#
+# AU_INDEX / AL_INDEX are deliberately NOT renamed to SMU / SML. They are a
+# different index family: AU/AL come from the 12-station AE observatory ring,
+# while SMU/SML are envelopes over SuperMAG's ~100+ station network. SuperMAG
+# resolves electrojet excursions the sparser ring misses, so |SML| generally
+# exceeds |AL|, and the gap widens with activity -- exactly the disturbed
+# conditions this model targets. Training (data_prep.py) reads true SMU/SML
+# from the SuperMAG feather file, so silently substituting AU/AL here would
+# feed the model a systematically different quantity than it learned on.
+#
+# They are carried through under their own names so that
+# _promote_supermag_indices() can decide explicitly whether to use them.
 _OMNI_COL_MAP = {
     "Vx":             "Vx",
     "BX_GSE":         "BX_GSE",
@@ -233,8 +742,8 @@ _OMNI_COL_MAP = {
     "proton_density": "proton_density",
     "SYM_H":          "SYM_H",
     "ASY_H":          "ASY_H",
-    "AU_INDEX":       "SMU",
-    "AL_INDEX":       "SML",
+    "AU_INDEX":       "AU_INDEX",
+    "AL_INDEX":       "AL_INDEX",
 }
 
 # Fill values used in OMNI CDFs for each variable (from omnitxtcdf.py metadata).
@@ -298,34 +807,139 @@ def _resolve_omni_cdf_filename(dt: datetime.datetime) -> str:
     return sorted(matches)[-1]
 
 
-def _fetch_omni_cdf(dt: datetime.datetime) -> Path:
+def _fetch_omni_cdf(dt: datetime.datetime,
+                    refresh: bool = False,
+                    check_version: bool = True) -> Path:
     """
-    Download the monthly 1-min OMNI CDF for the month containing dt if not
-    already cached. Resolves the exact filename from the SPDF directory listing
-    so version number changes are handled automatically.
-    Returns the local path to the CDF file.
+    Return a local path to the monthly 1-min OMNI CDF for the month containing
+    dt, downloading it if needed.
+
+    Parameters
+    ----------
+    refresh : bool
+        Ignore any cached copy and re-download.
+    check_version : bool
+        Ask SPDF which version is current and re-download if the cached copy
+        is superseded. OMNI months are revised after first publication (v01 ->
+        v02 and beyond) as calibrations are finalised, so a cache keyed only
+        on year/month will keep serving provisional data indefinitely. The
+        check costs one directory listing per month per session.
+
+        Recent months are the ones most likely to be revised, and also the
+        ones most likely to be in a prediction window, so this defaults on.
+        Pass check_version=False for offline or bulk work.
     """
     import requests as _requests
 
     _OMNI_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Check cache for any existing file matching this year/month
     prefix   = f"omni_hro_1min_{dt.year}{dt.month:02d}"
-    existing = list(_OMNI_CACHE_DIR.glob(f"{prefix}*.cdf"))
-    if existing:
-        return existing[0]
+    existing = sorted(_OMNI_CACHE_DIR.glob(f"{prefix}*.cdf"))
 
-    fn    = _resolve_omni_cdf_filename(dt)
+    if existing and not refresh:
+        # Highest version on disk, not merely the first glob hit.
+        cached = existing[-1]
+        if not check_version:
+            return cached
+        try:
+            remote_fn = _resolve_omni_cdf_filename(dt)
+        except Exception as e:
+            # Offline or listing unavailable: a cached file beats no file.
+            print(f"Could not check OMNI version for {dt:%Y-%m} ({e}); "
+                  f"using cached {cached.name}.")
+            return cached
+
+        if remote_fn == cached.name:
+            return cached
+
+        # Superseded: fetch the newer version but keep the old one on disk.
+        # Comparing versions is how a revision that moves results gets found,
+        # and that is impossible if the previous file has been deleted. Old
+        # versions are never read (the highest is always selected) so they
+        # cost only disk space.
+        print(f"OMNI {dt:%Y-%m}: cached {cached.name} superseded by "
+              f"{remote_fn}; downloading the newer version and keeping "
+              f"{cached.name} for comparison.")
+        fn = remote_fn
+    else:
+        if refresh and existing:
+            print(f"OMNI {dt:%Y-%m}: refresh requested; re-resolving current "
+                  f"version. {len(existing)} existing file(s) are kept.")
+        fn = _resolve_omni_cdf_filename(dt)
+
     local = _OMNI_CACHE_DIR / fn
     url   = f"{_OMNI_BASE_URL}/{dt.year}/{fn}"
 
     print(f"Downloading OMNI CDF: {url}")
     r = _requests.get(url, timeout=120)
     r.raise_for_status()
-    local.write_bytes(r.content)
+
+    # Write to a temporary name first so an interrupted download cannot leave
+    # a truncated file that later looks like a valid cache hit.
+    tmp = local.with_suffix(local.suffix + ".part")
+    tmp.write_bytes(r.content)
+    tmp.replace(local)
     print(f"Saved to {local}")
 
     return local
+
+
+def list_omni_cache() -> pd.DataFrame:
+    """
+    List cached OMNI CDFs with their sizes, flagging months held at more than
+    one version. Superseded versions are retained rather than deleted, so this
+    is how to find them.
+    """
+    if not _OMNI_CACHE_DIR.exists():
+        return pd.DataFrame(columns=["file", "month", "version", "mb"])
+
+    rows = []
+    for f in sorted(_OMNI_CACHE_DIR.glob("omni_hro_1min_*.cdf")):
+        stem = f.stem.replace("omni_hro_1min_", "")
+        parts = stem.split("_")
+        rows.append({"file": f.name,
+                     "month": parts[0][:6] if parts else "",
+                     "version": parts[-1] if len(parts) > 1 else "",
+                     "mb": round(f.stat().st_size / 1e6, 1)})
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        dupes = df["month"].duplicated(keep=False)
+        if dupes.any():
+            print("Months held at multiple versions:")
+            print(df[dupes].to_string(index=False))
+    return df
+
+
+def clear_omni_cache(year: Optional[int] = None,
+                     month: Optional[int] = None) -> int:
+    """
+    Delete cached OMNI CDFs and return the number removed.
+
+    Nothing else in this module deletes cached files -- superseded versions
+    are kept so they can be compared against their replacements. This is the
+    only way to remove them, and it is deliberate rather than automatic.
+
+    With no arguments, clears the whole cache. Pass year (and optionally
+    month) to clear a subset.
+    """
+    if not _OMNI_CACHE_DIR.exists():
+        return 0
+    if year is None:
+        pattern = "omni_hro_1min_*.cdf"
+    elif month is None:
+        pattern = f"omni_hro_1min_{year}*.cdf"
+    else:
+        pattern = f"omni_hro_1min_{year}{month:02d}*.cdf"
+
+    n = 0
+    for f in _OMNI_CACHE_DIR.glob(pattern):
+        try:
+            f.unlink()
+            n += 1
+        except OSError as e:
+            print(f"Could not remove {f.name}: {e}")
+    print(f"Removed {n} cached OMNI file(s) matching {pattern}")
+    return n
 
 
 def _read_omni_cdf(cdf_path: Path, startdt: datetime.datetime,
@@ -362,16 +976,26 @@ def _read_omni_cdf(cdf_path: Path, startdt: datetime.datetime,
 
 def _load_solarwind_omni(config: dict, startdt: datetime.datetime,
                          enddt: datetime.datetime,
-                         vars_to_keep: Optional[List[str]] = None) -> pd.DataFrame:
+                         vars_to_keep: Optional[List[str]] = None,
+                         allow_ae_substitution: bool = False,
+                         supermag_userid: Optional[str] = None,
+                         refresh_cache: bool = False,
+                         check_cdf_version: bool = True) -> pd.DataFrame:
     """
     Fetch OMNI 1-min solar wind data for [startdt, enddt] directly from NASA
     SPDF, with local CDF caching (~/.cache/omni_cdfs/). No third-party
     packages beyond cdflib (already required by processing_omni.py) are needed.
 
-    OMNI variable name mapping to training feature names:
-        AU_INDEX -> SMU
-        AL_INDEX -> SML
-        SME      -> derived as SMU - SML
+    SML / SMU / SME come from the SuperMAG web service, matching training.
+    OMNI's AU_INDEX / AL_INDEX are a different index family and are used only
+    when allow_ae_substitution=True; the source is recorded in
+    the returned frame's .attrs['index_source'].
+
+    Monthly CDFs are cached under ~/.cache/omni_cdfs/. By default the cache is
+    version-checked against SPDF, since OMNI months are revised after first
+    publication; pass check_cdf_version=False to skip that (offline use), or
+    refresh_cache=True to force a re-download. Superseded versions are kept on
+    disk -- see list_omni_cache() -- and only the highest version is read.
 
     Returns a DatetimeIndex DataFrame with only the model input columns,
     interpolated up to 10 minutes, and NaNs dropped.
@@ -385,42 +1009,71 @@ def _load_solarwind_omni(config: dict, startdt: datetime.datetime,
         months.append(cur)
         cur = (cur + datetime.timedelta(days=32)).replace(day=1)
 
-    # OMNI data is only available with a ~3-month processing lag.
-    # If the requested window is too recent, fall back to the NOAA live feed.
-    omni_cutoff = (datetime.datetime.utcnow()
-                   - datetime.timedelta(days=90)).replace(day=1)
-    if startdt >= omni_cutoff:
-        print(
-            f"Requested window {startdt.strftime('%Y-%m-%d')} is within the "
-            f"~3-month OMNI processing lag — falling back to NOAA live feed."
-        )
-        return _load_solarwind_realtime(config)
-
-    # Download (if needed) and read each monthly CDF
+    # OMNI is always attempted first, whatever the window's age.
+    #
+    # A fixed lag cutoff was previously used to decide this in advance, but a
+    # hardcoded guess is systematically wrong: OMNI's actual publication lag
+    # moves, and a too-conservative value routes windows to the NOAA live feed
+    # that OMNI could in fact serve. That silently costs SYM_H / ASY_H, which
+    # have no real-time source, and so silently downgrades the sci model.
+    # Asking the archive is cheap and always correct; guessing is not.
     frames = []
     errors = []
     for month_dt in months:
         try:
-            cdf_path = _fetch_omni_cdf(month_dt)
+            cdf_path = _fetch_omni_cdf(month_dt,
+                                       refresh=refresh_cache,
+                                       check_version=check_cdf_version)
             df       = _read_omni_cdf(cdf_path, startdt, enddt)
-            frames.append(df)
+            if df is not None and not df.empty:
+                frames.append(df)
+            else:
+                errors.append(f"  {month_dt.strftime('%Y-%m')}: no rows in range")
         except Exception as e:
             errors.append(f"  {month_dt.strftime('%Y-%m')}: {e}")
 
     if not frames:
-        error_detail = "\n".join(errors)
-        raise RuntimeError(
-            f"Failed to fetch any OMNI data for {startdt} -> {enddt}.\n"
-            f"Errors:\n{error_detail}"
-        )
+        # Genuinely outside the archive (or the fetch failed). Now -- and only
+        # now -- fall back to the live feed.
+        print(f"OMNI returned no data for {startdt:%Y-%m-%d} -> {enddt:%Y-%m-%d}:")
+        print("\n".join(errors))
+        print("Falling back to the NOAA real-time feed. Note this feed covers "
+              "only the last ~24 h and carries no SYM_H / ASY_H, so the sci "
+              "model will not run on it.")
+        return _load_solarwind_realtime(
+            config, vars_to_keep=vars_to_keep, supermag_userid=supermag_userid)
+
     if errors:
         print("Warning: some months could not be fetched:\n" + "\n".join(errors))
 
     solarwind = pd.concat(frames).sort_index()
     solarwind = solarwind[~solarwind.index.duplicated(keep="first")]
 
-    # Derive SME = SMU - SML
-    solarwind["SME"] = solarwind["SMU"] - solarwind["SML"]
+    # Report how much of the request OMNI actually covered. A window that
+    # straddles the publication boundary returns partial data rather than
+    # failing, and silently predicting on a truncated window is worse than
+    # knowing it was truncated.
+    req_start, req_end = pd.Timestamp(startdt), pd.Timestamp(enddt)
+    got_start, got_end = solarwind.index.min(), solarwind.index.max()
+    expected = max(int((req_end - req_start).total_seconds() // 60), 1)
+    print(f"OMNI covered {got_start} -> {got_end} "
+          f"({len(solarwind)}/{expected} minutes of the request).")
+    if got_end < req_end - pd.Timedelta(hours=1):
+        print(f"Note: OMNI stops {req_end - got_end} short of the requested "
+              f"end. This is the publication lag; the archive has not caught "
+              f"up to that date yet.")
+
+    # SML / SMU / SME: fetched from SuperMAG, which is what the model was
+    # trained on. Falls back to OMNI's AE-ring AL/AU only if explicitly
+    # permitted, and records which source was used in solarwind.attrs.
+    solarwind = _promote_supermag_indices(
+        solarwind, startdt, enddt,
+        allow_ae_substitution=allow_ae_substitution,
+        supermag_userid=supermag_userid,
+    )
+
+    # OMNI Vx is already negative; assert it rather than assume it.
+    solarwind = _enforce_vx_sign(solarwind, source="OMNI")
 
     # Cyclical month encoding
     months_col = solarwind.index.month
@@ -428,19 +1081,21 @@ def _load_solarwind_omni(config: dict, startdt: datetime.datetime,
     solarwind["sin_month"] = np.sin(months_col * 2 * np.pi / 12)
     solarwind["cos_month"] = np.cos(months_col * 2 * np.pi / 12)
 
-    # F10.7 — fetch live scalar and broadcast
-    solarwind["F107"] = _fetch_f107()
+    # F10.7 — must vary across a historical window; see _apply_f107.
+    solarwind = _apply_f107(solarwind, startdt, enddt)
 
-    # Interpolate gaps up to 10 minutes then drop remaining NaNs
-    solarwind = solarwind.interpolate(method="linear", limit=10).ffill().bfill()
+    # Fill short gaps; raise if an input is wholly unavailable.
+    solarwind = _fill_and_validate(
+        solarwind, vars_to_keep,
+        model_name=config.get("version", ""))
 
-    # Keep only model input columns, drop storm param
-    available = [c for c in vars_to_keep if c in solarwind.columns]
-    missing   = [c for c in vars_to_keep if c not in solarwind.columns]
-    if missing:
-        print(f"Warning: OMNI fetch is missing columns {missing}.")
-    solarwind = solarwind[available]
+    solarwind = solarwind[vars_to_keep]
     solarwind.dropna(inplace=True)
+
+    if solarwind.empty:
+        raise RuntimeError(
+            "No complete rows remain after gap filling; every timestamp is "
+            "missing at least one model input.")
 
     return solarwind
 
@@ -525,6 +1180,8 @@ class FACInference:
         model_path:      Optional[str] = None,
         lookback_limit:  int           = 10,
         realtime:        bool          = False,
+        allow_ae_substitution: bool    = False,
+        supermag_userid: Optional[str] = None,
     ):
         # utils.load_config performs the shared/per-model merge and
         # validates the model name, so inference and training resolve
@@ -536,6 +1193,16 @@ class FACInference:
         self._ampere_delay = self.config.get("ampere_delay", 0)
         self._here         = Path(config_path).resolve().parent
         self._lookback_limit = lookback_limit
+
+        # SML/SMU source policy. See _promote_supermag_indices: AE-ring AL/AU
+        # are a different index family from SuperMAG's SML/SMU, so falling
+        # back to them is opt-in rather than automatic.
+        self._allow_ae_substitution = allow_ae_substitution
+        self._supermag_userid = supermag_userid
+
+        # SHAP climatology background, built lazily and reused across calls.
+        self._clim_background = None
+        self._config_path = config_path
 
         # ── Model path ────────────────────────────────────────────────────────
         if model_path is not None:
@@ -591,14 +1258,18 @@ class FACInference:
           - realtime=False              -> NASA SPDF OMNI 1-min CDF fetch
         """
         if self._realtime:
-            solarwind = _load_solarwind_realtime(self.config)
+            solarwind = _load_solarwind_realtime(
+                self.config, supermag_userid=self._supermag_userid)
         else:
             if startdt is None or enddt is None:
                 raise ValueError(
                     "startdt and enddt must be provided for OMNI historical fetch."
                 )
             print(f"Fetching historical OMNI data: {startdt} -> {enddt}")
-            solarwind = _load_solarwind_omni(self.config, startdt, enddt)
+            solarwind = _load_solarwind_omni(
+                self.config, startdt, enddt,
+                allow_ae_substitution=self._allow_ae_substitution,
+                supermag_userid=self._supermag_userid)
 
         self._sw_values    = solarwind.to_numpy()
         self._sw_index     = solarwind.index
@@ -877,6 +1548,249 @@ class FACInference:
 
         return mean, std
 
+    def explain(
+        self,
+        timestamp=None,
+        target: str = "overall",
+        mlat_range=None,
+        mlt_range=None,
+        channel: int = 0,
+        baseline: str = "climatology",
+        n_background: int = 200,
+        background=None,
+        absolute: bool = True,
+        seed: int = 0,
+    ) -> dict:
+        """
+        SHAP attribution for a prediction: which driver, at which lag, moved
+        the regional mean |FAC|.
+
+        Parameters
+        ----------
+        timestamp : str, optional
+            Timestamp to explain. Defaults to the latest available.
+        target : str
+            'overall', a SHAP_REGIONS label such as 'R1 Dusk', or 'custom'
+            with mlat_range / mlt_range.
+        mlat_range, mlt_range : tuple, optional
+            (low, high) degrees and (start, end) hours for a custom region.
+            MLT may wrap through midnight, e.g. (21, 2).
+        channel : int
+            0 for the mean field, 1 for the predicted std.
+        baseline : str
+            'climatology' (default) samples the training record, stratified
+            over activity, so values read as "what makes this moment unusual
+            relative to the conditions the model learned". Stable, and
+            comparable between predictions.
+            'window' samples the currently fetched period instead, answering
+            "what makes this moment unusual for today" -- cheaper, but the
+            reference moves every run so values cannot be compared across
+            events.
+        n_background : int
+            Reference samples. SHAP values are differences from this baseline,
+            so the baseline defines what the numbers mean.
+        background : np.ndarray, optional
+            Explicit background of shape (M, T, F), already scaled. Overrides
+            `baseline`.
+        absolute : bool
+            Take |FAC| before the regional mean. Keep True for multi-sheet
+            regions, where signed averaging cancels R1 against R2.
+
+        Returns
+        -------
+        dict with keys:
+            shap        (T, F) SHAP values, lag x parameter
+            param_total (F,)   sum of |shap| over lag, per parameter
+            param_pct   (F,)   the same as a percentage
+            lag_total   (T,)   sum of |shap| over parameters, per lag
+            params, timestamp, label, rows, cols, base_value, prediction
+        """
+        rows, cols, label = resolve_shap_target(target, mlat_range, mlt_range)
+        ctx = self._shap_context(timestamp=timestamp, baseline=baseline,
+                                 n_background=n_background,
+                                 background=background, seed=seed)
+        return self._explain_one(ctx, rows, cols, label,
+                                 channel=channel, absolute=absolute)
+
+    def _shap_context(self, timestamp=None, baseline="climatology",
+                      n_background=200, background=None, seed=0) -> dict:
+        """
+        Fetch the data and reference set for SHAP, once.
+
+        Separated from the attribution itself so that explaining several
+        regions uses one fetch. Repeating the fetch per region is not only
+        slower: a long loop can straddle a data update, and regions explained
+        either side of it would be attributed against different inputs while
+        appearing to be one coherent set.
+        """
+        try:
+            import shap as _shap
+        except ImportError:
+            raise ImportError("shap is required: pip install shap")
+
+        mean, std, time, sequences = self.predict(timestamp=timestamp)
+        if sequences.ndim == 2:
+            sequences = sequences[np.newaxis, ...]
+        x = sequences[-1:]                                   # (1, T, F)
+
+        if background is None:
+            if baseline == "climatology":
+                # Cached on the instance: rebuilding per call would reload the
+                # whole training record, and a background that shifted between
+                # calls would make successive explanations incomparable.
+                if self._clim_background is None:
+                    self._clim_background = build_climatology_background(
+                        config_path=str(self._config_path),
+                        model_variant=self._model_variant,
+                        n_samples=n_background, seed=seed,
+                        scaler=self._scaler)
+                background = self._clim_background
+                baseline_desc = "training climatology"
+            elif baseline == "window":
+                pool = self._all_sequences(exclude_last=True)
+                if pool is None or len(pool) == 0:
+                    print("Only one sequence available; using a zero "
+                          "(training-mean) baseline.")
+                    background = np.zeros_like(x)
+                else:
+                    rng = np.random.default_rng(seed)
+                    take = rng.choice(len(pool),
+                                      size=min(n_background, len(pool)),
+                                      replace=False)
+                    background = pool[take]
+                baseline_desc = "recent window (NOT comparable across runs)"
+            else:
+                raise ValueError(
+                    f"baseline must be 'climatology' or 'window', got {baseline!r}")
+        else:
+            baseline_desc = "caller-supplied"
+        background = np.asarray(background, dtype=np.float32)
+
+        print(f"SHAP context ready: {len(background)} background samples "
+              f"({baseline_desc}), timestamp {time}")
+
+        try:
+            phys = self._scaler.inverse_transform(x[0])
+        except Exception:
+            phys = None
+
+        return {"x": x, "background": background, "time": time,
+                "baseline_desc": baseline_desc, "physical": phys,
+                "mean": mean, "std": std, "shap_mod": _shap}
+
+    def _explain_one(self, ctx, rows, cols, label, channel=0, absolute=True):
+        """Attribute one region using an already-built context."""
+        _shap = ctx["shap_mod"]
+        x, background = ctx["x"], ctx["background"]
+
+        print(f"  SHAP: {label!r}  {len(rows)}x{len(cols)} cells")
+
+        wrapper = _RegionalMeanWrapper(self._model, rows, cols,
+                                       channel=channel, absolute=absolute)
+        wrapper.eval().to(DEVICE)
+
+        bg_t = torch.tensor(background, dtype=torch.float32).unsqueeze(1).to(DEVICE)
+        x_t  = torch.tensor(x, dtype=torch.float32).unsqueeze(1).to(DEVICE)
+
+        # GradientExplainer construction runs the model; no_grad keeps it from
+        # holding a graph over the whole background set.
+        with torch.no_grad():
+            explainer = _shap.GradientExplainer(wrapper, bg_t)
+        raw = explainer.shap_values(x_t)
+
+        vals = raw[0] if isinstance(raw, list) else raw
+        vals = np.asarray(vals)
+        vals = np.squeeze(vals)                      # -> (T, F)
+        if vals.ndim != 2:
+            vals = vals.reshape(x.shape[1], x.shape[2])
+
+        with torch.no_grad():
+            pred_val = float(wrapper(x_t).cpu().numpy().ravel()[0])
+            base_val = float(wrapper(bg_t).cpu().numpy().mean())
+
+        params = list(self.config["input_params"])
+        absum  = np.abs(vals).sum(axis=0)
+        total  = absum.sum()
+        signed = vals.sum(axis=0)
+
+        # Peak-contributing lag per parameter, and the sign there. Useful for
+        # reading response time: Bz peaking at 20-40 min is the reconnection
+        # delay, while F107 peaking anywhere is an artefact of it being
+        # constant within a day.
+        peak_lag = np.abs(vals).argmax(axis=0)
+        peak_val = vals[peak_lag, np.arange(vals.shape[1])]
+
+        return {
+            "shap":         vals,
+            "params":       params,
+            "param_total":  absum,
+            "param_pct":    100.0 * absum / total if total > 0 else absum * 0,
+            "param_signed": signed,
+            # Share of the net effect, ranking on the signed sum. A driver
+            # whose contributions cancel across the lookback did not move the
+            # prediction, however large its individual values were, so this is
+            # the more meaningful importance measure for most purposes;
+            # param_pct is retained for magnitude questions.
+            "signed_pct":   (100.0 * np.abs(signed) / np.abs(signed).sum()
+                             if np.abs(signed).sum() > 0 else signed * 0),
+            "cancellation": np.divide(signed, absum,
+                                      out=np.zeros_like(signed),
+                                      where=absum > 0),
+            "peak_lag":     peak_lag,
+            "peak_value":   peak_val,
+            "physical":     ctx["physical"],
+            "lag_total":    np.abs(vals).sum(axis=1),
+            "lag_signed":   vals.sum(axis=1),
+            "timestamp":   ctx["time"],
+            "label":       label,
+            "channel":     channel,
+            "rows":        rows,
+            "cols":        cols,
+            "base_value":  base_val,
+            "prediction":  pred_val,
+            "baseline":    ctx["baseline_desc"],
+        }
+
+    def explain_regions(self, regions=None, timestamp=None, channel=0,
+                        baseline="climatology", n_background=200,
+                        background=None, absolute=True, seed=0) -> dict:
+        """
+        Attribute every region in one pass, sharing a single data fetch and a
+        single background set.
+
+        Returns {label: explain_result}. Because all regions are attributed
+        against identical inputs and an identical reference, the results are
+        directly comparable with each other -- which is not guaranteed when
+        explain() is called in a loop, since each call refetches.
+        """
+        regions = regions if regions is not None else SHAP_REGIONS
+        ctx = self._shap_context(timestamp=timestamp, baseline=baseline,
+                                 n_background=n_background,
+                                 background=background, seed=seed)
+        out = {}
+        for reg in regions:
+            rows = mlat_to_indices(reg["mlat_low"], reg["mlat_high"])
+            cols = mlt_to_indices(reg["mlt_start"], reg["mlt_end"])
+            out[reg["label"]] = self._explain_one(
+                ctx, rows, cols, reg["label"],
+                channel=channel, absolute=absolute)
+        return out
+
+    def _all_sequences(self, exclude_last: bool = True):
+        """
+        Every sequence buildable from the currently loaded window, for use as
+        a SHAP background.
+        """
+        T = self._time_history
+        n = len(self._sw_values)
+        if n <= T:
+            return None
+        stack = np.stack([self._sw_values[i - T:i] for i in range(T, n)], axis=0)
+        N, TT, F = stack.shape
+        scaled = self._scaler.transform(stack.reshape(N * TT, F)).reshape(N, TT, F)
+        return scaled[:-1] if exclude_last and len(scaled) > 1 else scaled
+
+
     def load_ampere(self, timestamp: str) -> Optional[np.ndarray]:
         """
         Load the AMPERE observed current density for a given timestamp from
@@ -1005,6 +1919,8 @@ class TFACInference:
         norm_path:      Optional[str] = None,
         lookback_limit: int           = 10,
         realtime:       bool          = False,
+        allow_ae_substitution: bool   = False,
+        supermag_userid: Optional[str] = None,
     ):
 
         # Same merged config as the PyTorch wrapper; model_type selects
@@ -1014,6 +1930,10 @@ class TFACInference:
         self._time_history  = self.config.get("time_history", 60)
         self._ampere_delay  = self.config.get("ampere_delay", 0)
         self._lookback_limit = lookback_limit
+
+        # See FACInference: AE-ring AL/AU are not SuperMAG SML/SMU.
+        self._allow_ae_substitution = allow_ae_substitution
+        self._supermag_userid = supermag_userid
         self._realtime      = realtime
         self._here          = Path(config_path).resolve().parent
 
@@ -1128,13 +2048,17 @@ class TFACInference:
         input_renamed = {v:k for k,v in self._OMNI_RENAME.items()}
         input_cols = [input_renamed.get(x,x) for x in self._INPUT_COLS]
         if self._realtime:
-            solarwind = _load_solarwind_realtime(self.config, vars_to_keep=input_cols)
+            solarwind = _load_solarwind_realtime(
+                self.config, vars_to_keep=input_cols,
+                supermag_userid=self._supermag_userid)
         else:
             if startdt is None or enddt is None:
                 raise ValueError("startdt and enddt required for OMNI fetch.")
             print(f"Fetching OMNI data for TF model: {startdt} -> {enddt}")
             solarwind = _load_solarwind_omni(
-                self.config, startdt, enddt, vars_to_keep=input_cols
+                self.config, startdt, enddt, vars_to_keep=input_cols,
+                allow_ae_substitution=self._allow_ae_substitution,
+                supermag_userid=self._supermag_userid,
             )
 
         # Rename OMNI column names to TF model input names
@@ -1393,16 +2317,628 @@ class TFACInference:
 # Smoke test
 # ══════════════════════════════════════════════════════════════════════════════
 
-def testing_polar_plot(samples, time, labels):
-    """Quick polar plot for sanity-checking model outputs side by side."""
+# ══════════════════════════════════════════════════════════════════════════════
+# SHAP attribution
+#
+# Explains which solar wind drivers, at which lag, produced a given prediction.
+# The attribution target is selectable, because "what drove this prediction" is
+# not one question: the drivers of total activity, of a named current system,
+# and of one patch of sky are different quantities.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Grid geometry, matching data_prep / shap_values.py.
+# MLAT runs 40-90 deg over 50 bins with index 0 at the pole (90 deg).
+_MLAT_MIN, _MLAT_MAX = 40.0, 90.0
+_N_MLAT, _N_MLT      = 50, 24
+
+# The regions used for the regional HSS / NRMSE evaluation, so SHAP results
+# can be read against those metrics directly.
+SHAP_REGIONS = [
+    {'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start':  9, 'mlt_end': 14, 'label': 'R0 Dayside'},
+    {'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start': 15, 'mlt_end': 20, 'label': 'R0 Dusk'},
+    {'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start': 21, 'mlt_end':  2, 'label': 'R0 Nightside'},
+    {'mlat_low': 80.0, 'mlat_high': 90.0, 'mlt_start':  3, 'mlt_end':  8, 'label': 'R0 Dawn'},
+    {'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start':  9, 'mlt_end': 14, 'label': 'R1 Dayside'},
+    {'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start': 15, 'mlt_end': 20, 'label': 'R1 Dusk'},
+    {'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start': 21, 'mlt_end':  2, 'label': 'R1 Nightside'},
+    {'mlat_low': 70.0, 'mlat_high': 79.0, 'mlt_start':  3, 'mlt_end':  8, 'label': 'R1 Dawn'},
+    {'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  9, 'mlt_end': 14, 'label': 'R2 Dayside'},
+    {'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start': 15, 'mlt_end': 20, 'label': 'R2 Dusk'},
+    {'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start': 21, 'mlt_end':  2, 'label': 'R2 Nightside'},
+    {'mlat_low': 50.0, 'mlat_high': 69.0, 'mlt_start':  3, 'mlt_end':  8, 'label': 'R2 Dawn'},
+]
+
+
+def mlat_to_indices(mlat_low: float, mlat_high: float) -> List[int]:
+    """Row indices covering [mlat_low, mlat_high]. Index 0 is the pole."""
+    bw       = (_MLAT_MAX - _MLAT_MIN) / _N_MLAT
+    idx_pole = max(int((_MLAT_MAX - mlat_high) / bw), 0)
+    idx_eq   = min(int((_MLAT_MAX - mlat_low) / bw), _N_MLAT - 1)
+    return list(range(idx_pole, idx_eq + 1))
+
+
+def mlt_to_indices(mlt_start: int, mlt_end: int) -> List[int]:
+    """Column indices from mlt_start to mlt_end, wrapping through midnight."""
+    s, e = int(mlt_start) % _N_MLT, int(mlt_end) % _N_MLT
+    if s > e:
+        return list(range(s, _N_MLT)) + list(range(0, e + 1))
+    return list(range(s, e + 1))
+
+
+def resolve_shap_target(target="overall", mlat_range=None, mlt_range=None):
+    """
+    Resolve an attribution target into (row_indices, col_indices, label).
+
+    target : str
+        'overall'                -> the whole grid
+        a region label           -> one of SHAP_REGIONS, e.g. 'R1 Dusk'
+        'custom'                 -> use mlat_range and mlt_range
+    mlat_range : (low, high) in degrees, e.g. (70, 79)
+    mlt_range  : (start, end) in hours, wrapping allowed, e.g. (21, 2)
+    """
+    if target == "overall":
+        return list(range(_N_MLAT)), list(range(_N_MLT)), "Overall"
+
+    if target == "custom" or (mlat_range is not None and mlt_range is not None):
+        if mlat_range is None or mlt_range is None:
+            raise ValueError("custom target needs both mlat_range and mlt_range")
+        rows = mlat_to_indices(*mlat_range)
+        cols = mlt_to_indices(*mlt_range)
+        if not rows:
+            raise ValueError(f"mlat_range {mlat_range} selects no rows "
+                             f"(grid covers {_MLAT_MIN}-{_MLAT_MAX} deg)")
+        label = (f"MLAT {mlat_range[0]:g}-{mlat_range[1]:g}, "
+                 f"MLT {mlt_range[0]:g}-{mlt_range[1]:g}")
+        return rows, cols, label
+
+    match = [r for r in SHAP_REGIONS if r["label"].lower() == str(target).lower()]
+    if not match:
+        raise ValueError(
+            f"Unknown target {target!r}. Use 'overall', 'custom', or one of: "
+            + ", ".join(r["label"] for r in SHAP_REGIONS))
+    r = match[0]
+    return (mlat_to_indices(r["mlat_low"], r["mlat_high"]),
+            mlt_to_indices(r["mlt_start"], r["mlt_end"]),
+            r["label"])
+
+
+class _RegionalMeanWrapper(torch.nn.Module):
+    """
+    Wraps ACORN so it emits one scalar per sample: the mean of |FAC| over the
+    selected region.
+
+    The absolute value is taken before averaging. R1 and R2 currents are
+    oppositely signed, so a signed regional mean would cancel them against
+    each other and attribute near-zero importance to drivers that in fact
+    control both sheets.
+    """
+
+    def __init__(self, model, rows, cols, channel=0, absolute=True):
+        super().__init__()
+        self.model = model
+        self.register_buffer("rows", torch.as_tensor(rows, dtype=torch.long))
+        self.register_buffer("cols", torch.as_tensor(cols, dtype=torch.long))
+        self.channel  = channel
+        self.absolute = absolute
+
+    def forward(self, x):
+        out = self.model(x)
+        if out.dim() == 3:
+            out = out.unsqueeze(0)
+        # Trim midnight-looping padding on 50x26 variants.
+        if out.shape[3] > _N_MLT:
+            out = out[:, :, :, 1:-1]
+        field = out[:, self.channel, :, :]
+        field = field[:, self.rows, :][:, :, self.cols]
+        if self.absolute:
+            field = field.abs()
+        return field.mean(dim=(1, 2), keepdim=False).unsqueeze(-1)
+
+
+# ── Climatology background for SHAP ──────────────────────────────────────────
+
+_BACKGROUND_CACHE_DIR = Path(os.path.expanduser("~/.cache/acorn_shap_background"))
+
+
+def build_climatology_background(config_path: str = "config.json",
+                                 model_variant: Optional[str] = None,
+                                 n_samples: int = 200,
+                                 seed: int = 0,
+                                 stratify: bool = True,
+                                 cache: bool = True,
+                                 rebuild: bool = False,
+                                 scaler=None) -> np.ndarray:
+    """
+    Sample input sequences from the training record to serve as a SHAP
+    climatology baseline.
+
+    Why this rather than the recent window: SHAP values are differences from
+    a reference, so the reference defines the question. A background drawn
+    from the last 24 h answers "what makes this moment unusual for today",
+    which changes meaning every time it is run and cannot be compared across
+    events. A background drawn from the full training record answers "what
+    makes this moment unusual relative to the conditions the model learned" --
+    stable, and comparable between one prediction and another.
+
+    Sampling is stratified over solar wind driving by default. A uniform
+    random sample of the record would be dominated by quiet intervals, since
+    quiet time is most of the record, and would make every storm prediction
+    look extreme for the same undifferentiated reason. Stratifying across
+    activity deciles keeps disturbed conditions represented in the baseline.
+
+    Returns an array of shape (n_samples, T, F), already scaled, ready to
+    pass to FACInference.explain(background=...).
+    """
+    cfg = _resolve_data_dir(utils.load_config(model_variant, config_path))
+    variant = cfg["model_name"]
+    T = cfg.get("time_history", 60)
+    params = list(cfg["input_params"])
+
+    key = f"{variant}_n{n_samples}_T{T}_s{seed}_{'strat' if stratify else 'unif'}"
+    cache_path = _BACKGROUND_CACHE_DIR / f"background_{key}.npz"
+
+    if cache and cache_path.exists() and not rebuild:
+        d = np.load(cache_path, allow_pickle=True)
+        if list(d["params"]) == params:
+            print(f"Loaded cached climatology background: {cache_path.name} "
+                  f"{d['background'].shape}")
+            return d["background"]
+        print("Cached background has different input params; rebuilding.")
+
+    import data_prep
+
+    print(f"Building climatology background for '{variant}' "
+          f"({n_samples} samples, T={T})...")
+    prep = data_prep.PreparingData(model=variant)
+    prep.loading_solarwind()
+    sw = prep.solarwind[params].copy()
+
+    vals = sw.to_numpy()
+    n = len(vals)
+    if n <= T:
+        raise RuntimeError(f"Training record has only {n} rows; need > {T}.")
+
+    # Candidate window end positions with no NaN anywhere in the window.
+    ok = ~np.isnan(vals).any(axis=1)
+    csum = np.concatenate([[0], np.cumsum(ok)])
+    ends = np.array([i for i in range(T, n) if csum[i] - csum[i - T] == T])
+    if len(ends) == 0:
+        raise RuntimeError("No complete NaN-free windows in the training record.")
+    print(f"  {len(ends)} complete windows available")
+
+    rng = np.random.default_rng(seed)
+
+    if stratify and len(ends) > n_samples:
+        # Stratify on a coupling proxy: |Vx| * |Bz| at the window end, which
+        # tracks the dayside reconnection driving that sets FAC magnitude.
+        try:
+            vx = np.abs(vals[ends, params.index("Vx")])
+            bz = np.abs(vals[ends, params.index("BZ_GSM")])
+            drive = vx * bz
+        except ValueError:
+            drive = np.abs(vals[ends]).sum(axis=1)
+
+        deciles = np.quantile(drive, np.linspace(0, 1, 11))
+        per_bin = max(1, n_samples // 10)
+        picks = []
+        for lo, hi in zip(deciles[:-1], deciles[1:]):
+            m = (drive >= lo) & (drive <= hi)
+            pool = ends[m]
+            if len(pool) == 0:
+                continue
+            take = rng.choice(pool, size=min(per_bin, len(pool)), replace=False)
+            picks.append(take)
+        chosen = np.concatenate(picks)
+        if len(chosen) < n_samples:
+            extra = rng.choice(np.setdiff1d(ends, chosen),
+                               size=min(n_samples - len(chosen),
+                                        len(np.setdiff1d(ends, chosen))),
+                               replace=False)
+            chosen = np.concatenate([chosen, extra])
+        chosen = chosen[:n_samples]
+        print(f"  stratified across activity deciles")
+    else:
+        chosen = rng.choice(ends, size=min(n_samples, len(ends)), replace=False)
+
+    windows = np.stack([vals[e - T:e] for e in chosen], axis=0)
+
+    if scaler is None:
+        scaler_name = cfg.get("scaler_name") or cfg.get("scaler")
+        scaler_path = None
+        if scaler_name:
+            for base in (Path(config_path).resolve().parent,
+                         Path(cfg.get("model_dir", "models/"))):
+                p = Path(base) / scaler_name
+                if p.exists():
+                    scaler_path = p
+                    break
+        if scaler_path is None:
+            raise RuntimeError(
+                "No scaler available to build the background. Pass "
+                "scaler=<fitted scaler>, e.g. FACInference's _scaler, or set "
+                "'scaler_name' in the config.")
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+
+    N, TT, F = windows.shape
+    scaled = scaler.transform(windows.reshape(N * TT, F)).reshape(N, TT, F)
+
+    if cache:
+        _BACKGROUND_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, background=scaled,
+                            params=np.array(params, dtype=object),
+                            timestamps=np.array(
+                                [str(sw.index[e]) for e in chosen], dtype=object))
+        print(f"  cached to {cache_path}")
+
+    print(f"  background ready: {scaled.shape}")
+    return scaled
+
+
+def auto_inference(config_path: str = "config.json",
+                   preferred: str = "sci",
+                   fallback: str = "op",
+                   realtime: bool = False,
+                   timestamp=None,
+                   startdt: Optional[datetime.datetime] = None,
+                   enddt: Optional[datetime.datetime] = None,
+                   verbose: bool = True,
+                   **kwargs):
+    """
+    Build a FACInference using `preferred`, falling back to `fallback` when the
+    preferred model's inputs are not all obtainable for the window.
+
+    Returns (wrapper, variant_used) -- the variant is returned rather than
+    only printed because these are different models, not two settings of one
+    model. ACORN Sci and ACORN Op differ in architecture, inputs and skill, so
+    a figure or a stored result must be labelled with whichever actually ran.
+    Callers that need a specific model should instantiate FACInference
+    directly instead of using this.
+
+    The availability probe fetches the input frame once and checks it against
+    the preferred model's input_params. That frame is discarded and refetched
+    by the wrapper; for OMNI windows the CDF cache makes the second fetch
+    cheap, but this does cost an extra SuperMAG call.
+
+    Parameters
+    ----------
+    preferred, fallback : str
+        Model variants to try, in order.
+    realtime : bool
+        Probe the live feed rather than the OMNI archive.
+    startdt, enddt : datetime, optional
+        Window to probe when realtime=False. Defaults to the last 24 h of
+        whatever OMNI has published, which is what predict() with no
+        arguments will use.
+    **kwargs
+        Passed through to FACInference (model_path, lookback_limit,
+        allow_ae_substitution, supermag_userid, ...).
+    """
+    probe_config = _resolve_data_dir(utils.load_config(preferred, config_path))
+    needed = probe_config["input_params"]
+
+    # A timestamp implies a historical run. The probe window must cover the
+    # model's lookback as well as the timestamp itself, or the probe would
+    # pass on a window the prediction then cannot build a sequence from.
+    if timestamp is not None:
+        realtime = False
+        ts = pd.Timestamp(timestamp).to_pydatetime()
+        pad = datetime.timedelta(
+            minutes=probe_config.get("time_history", 60)
+                    + kwargs.get("lookback_limit", 10) + 10)
+        if startdt is None:
+            startdt = ts - pad
+        if enddt is None:
+            enddt = ts + datetime.timedelta(minutes=1)
+
+    if verbose:
+        when = ("real-time" if realtime
+                else f"{startdt:%Y-%m-%d %H:%M} -> {enddt:%Y-%m-%d %H:%M}"
+                if startdt is not None else "OMNI")
+        print(f"Checking whether '{preferred}' inputs are available ({when})...")
+
+    reason = None
+    try:
+        if realtime:
+            _load_solarwind_realtime(
+                probe_config, vars_to_keep=needed,
+                supermag_userid=kwargs.get("supermag_userid"))
+        else:
+            if enddt is None:
+                enddt = datetime.datetime.utcnow()
+            if startdt is None:
+                startdt = enddt - datetime.timedelta(days=1)
+            _load_solarwind_omni(
+                probe_config, startdt, enddt, vars_to_keep=needed,
+                allow_ae_substitution=kwargs.get("allow_ae_substitution", False),
+                supermag_userid=kwargs.get("supermag_userid"))
+        chosen = preferred
+    except Exception as e:
+        reason = str(e).split("\n")[0]
+        chosen = fallback
+
+    if chosen != preferred:
+        print("")
+        print(f"  '{preferred}' cannot run on this window: {reason}")
+        print(f"  Falling back to '{fallback}'.")
+        print(f"  NOTE: these are different models. Output is "
+              f"{utils.load_config(fallback, config_path).get('version', fallback)}, "
+              f"not {probe_config.get('version', preferred)}; label results "
+              f"accordingly.")
+        print("")
+    elif verbose:
+        print(f"'{preferred}' inputs are available; using it.")
+
+    wrapper = FACInference(config_path=config_path, model_variant=chosen,
+                           realtime=realtime, **kwargs)
+    return wrapper, chosen
+
+
+def plot_region_shap_polar(results, params=None, ncols=4, figsize_per=3.0,
+                           channel_label="net SHAP"):
+    """
+    One polar panel per input parameter, each filled with that parameter's net
+    SHAP contribution in every region.
+
+    `results` is the dict returned by explain_regions(). Regions that do not
+    tile the grid are left blank rather than interpolated, so a gap is visibly
+    a gap.
+
+    Each parameter gets its own symmetric colour scale, because the drivers
+    differ in magnitude by more than an order of magnitude and a shared scale
+    would flatten the weaker ones to invisibility. Read within a panel, not
+    across panels.
+    """
+    labels = list(results.keys())
+    params = params or results[labels[0]]["params"]
+
+    n = len(params)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per * ncols, figsize_per * nrows),
+                             subplot_kw=dict(projection="polar"))
+    axes = np.atleast_1d(axes).ravel()
+
+    r, th = np.meshgrid(
+        np.linspace(0, _N_MLAT, _N_MLAT, endpoint=False),
+        np.linspace(0, 2 * np.pi, _N_MLT, endpoint=False),
+    )
+
+    for ax, pi in zip(axes, range(n)):
+        grid = np.full((_N_MLAT, _N_MLT), np.nan)
+        for lab in labels:
+            e = results[lab]
+            grid[np.ix_(e["rows"], e["cols"])] = e["param_signed"][pi]
+
+        lim = np.nanmax(np.abs(grid))
+        lim = lim if (lim and np.isfinite(lim)) else 1.0
+        mesh = ax.pcolormesh(th, r, grid.T, cmap="bwr",
+                             norm=mpl.colors.Normalize(-lim, lim),
+                             shading="auto")
+
+        ax.set_theta_zero_location("S")
+        ax.set_theta_direction(1)
+        ax.set_xticks(np.linspace(0, 2 * np.pi, 8, endpoint=False))
+        ax.set_xticklabels([])
+        ax.set_yticks(np.linspace(0, _N_MLAT, 5, endpoint=False))
+        ax.set_yticklabels([])
+        ax.set_ylim(0, 35)
+        ax.set_title(params[pi], fontsize=11)
+        fig.colorbar(mesh, ax=ax, fraction=0.045, pad=0.06).ax.tick_params(labelsize=7)
+
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    ts = results[labels[0]].get("timestamp")
+    ts_str = ts.strftime("%Y-%m-%d %H:%M UT") if hasattr(ts, "strftime") else str(ts)
+    plt.suptitle(f"{channel_label} by region and driver — {ts_str}", fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_region_lag_heatmaps(results, ncols=4, figsize_per=2.9):
+    """
+    SHAP by lag and driver, one panel per region, on a shared symmetric scale
+    so panels can be compared directly.
+    """
+    labels = list(results.keys())
+    params = results[labels[0]]["params"]
+    lim = max(np.abs(results[l]["shap"]).max() for l in labels) or 1.0
+
+    nrows = int(np.ceil(len(labels) / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per * ncols * 1.25,
+                                      figsize_per * nrows),
+                             sharex=True, sharey=True)
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, lab in zip(axes, labels):
+        v = results[lab]["shap"]
+        im = ax.pcolormesh(np.arange(v.shape[1] + 1),
+                           np.arange(v.shape[0] + 1), v,
+                           cmap="bwr", vmin=-lim, vmax=lim)
+        ax.set_title(lab, fontsize=10)
+        ax.set_xticks(np.arange(len(params)) + 0.5)
+        ax.set_xticklabels(params, rotation=90, fontsize=6)
+
+    for ax in axes[len(labels):]:
+        ax.set_visible(False)
+
+    for ax in axes[::ncols]:
+        ax.set_ylabel("lag (min)", fontsize=8)
+
+    cb = fig.colorbar(im, ax=axes.tolist(), fraction=0.02, pad=0.02)
+    cb.set_label("SHAP value")
+    plt.suptitle("SHAP by lag and driver, per region", fontsize=13)
+    plt.show()
+
+
+def plot_shap_region(expl=None, rows=None, cols=None, label=None,
+                     field=None, time=None, ax=None, show=True,
+                     highlight_color="limegreen"):
+    """
+    Show which cells a SHAP target covers, on the polar grid.
+
+    Pass either an explain() result (expl) or explicit rows/cols. If `field`
+    is given (a 50x24 prediction), it is drawn underneath with the region
+    outlined, so the attribution area can be read against the current pattern;
+    otherwise the region is drawn as a filled mask.
+
+    The region is built as a mask over the full grid rather than as a wedge
+    patch from degree bounds. Wedges drawn from bounds leave hairline gaps at
+    cell edges and mishandle MLT sectors that wrap through midnight (21-02);
+    a mask follows exactly the cells the attribution used.
+    """
+    if expl is not None:
+        rows = expl["rows"] if rows is None else rows
+        cols = expl["cols"] if cols is None else cols
+        label = expl["label"] if label is None else label
+        time = expl.get("timestamp") if time is None else time
+    if rows is None or cols is None:
+        raise ValueError("Provide expl, or both rows and cols.")
+
+    mask = np.zeros((_N_MLAT, _N_MLT), dtype=float)
+    mask[np.ix_(rows, cols)] = 1.0
+
+    created = ax is None
+    if created:
+        fig, ax = plt.subplots(figsize=(7, 7),
+                               subplot_kw=dict(projection="polar"))
+    else:
+        fig = ax.figure
+
+    r, th = np.meshgrid(
+        np.linspace(0, _N_MLAT, _N_MLAT, endpoint=False),
+        np.linspace(0, 2 * np.pi, _N_MLT, endpoint=False),
+    )
+
+    if field is not None:
+        f = np.asarray(field)
+        if f.ndim == 3:
+            f = f[0]
+        lim  = np.nanmax(np.abs(f)) or 1.0
+        norm = mpl.colors.Normalize(-lim, lim)
+
+        # Two layers of the same data: greyscale everywhere, colour only
+        # inside the region. Nothing is emphasised by being drawn heavier --
+        # the full field stays visible and readable, and colour marks the
+        # selection rather than signalling larger values.
+        outside = np.where(mask > 0, np.nan, f)
+        inside  = np.where(mask > 0, f, np.nan)
+
+        ax.pcolormesh(th, r, outside.T, cmap="Greys_r", norm=norm,
+                      shading="auto")
+        m = ax.pcolormesh(th, r, inside.T, cmap="bwr", norm=norm,
+                          shading="auto")
+        cb = fig.colorbar(m, ax=ax, fraction=0.046, pad=0.08)
+        cb.set_label(r"FAC ($\mu A/m^2$)")
+    else:
+        ax.pcolormesh(th, r, np.where(mask.T > 0, 1.0, np.nan),
+                      cmap=mpl.colors.ListedColormap([highlight_color]),
+                      shading="auto")
+
+    # Outline the region. The mask is padded with a zero border and wrapped
+    # in MLT so the contour closes properly for sectors that cross midnight
+    # (21-02) instead of leaving an open seam at the 0/24 boundary.
+    th_c = np.linspace(0, 2 * np.pi, _N_MLT, endpoint=False)
+    r_c  = np.arange(_N_MLAT, dtype=float)
+
+    dth = th_c[1] - th_c[0]
+    th_w = np.concatenate([[th_c[0] - dth], th_c, [th_c[-1] + dth]])
+    r_w  = np.concatenate([[r_c[0] - 1.0], r_c, [r_c[-1] + 1.0]])
+
+    m_w = np.zeros((_N_MLAT + 2, _N_MLT + 2))
+    m_w[1:-1, 1:-1] = mask
+    m_w[1:-1, 0]    = mask[:, -1]   # wrap: column before 0 is column 23
+    m_w[1:-1, -1]   = mask[:, 0]    # wrap: column after 23 is column 0
+
+    ax.contour(th_w, r_w, m_w, levels=[0.5],
+               colors=[highlight_color], linewidths=2.0)
+
+    ax.set_theta_zero_location("S")
+    ax.set_theta_direction(1)
+    ax.set_xticks(np.linspace(0, 2 * np.pi, 8, endpoint=False))
+    ax.set_xticklabels(['', '3', '', '9', '', '15', '', '21'])
+    ax.set_yticks(np.linspace(0, _N_MLAT, 5, endpoint=False))
+    ax.set_yticklabels(['', '80', '70', '60', '50'])
+    ax.set_ylim(0, 35)
+
+    n_cells = len(rows) * len(cols)
+    title = f"{label}  ({n_cells} cells)" if label else f"{n_cells} cells"
+    if time is not None:
+        ts = time.strftime("%Y-%m-%d %H:%M UT") if hasattr(time, "strftime") else str(time)
+        title = f"{title}\n{ts}"
+    ax.set_title(title)
+
+    if created and show:
+        plt.tight_layout()
+        plt.show()
+    return ax
+
+
+def plot_all_shap_regions(field=None, ncols=4, figsize_per=3.2):
+    """Grid of all SHAP_REGIONS, for picking a target."""
+    n = len(SHAP_REGIONS)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per * ncols, figsize_per * nrows),
+                             subplot_kw=dict(projection="polar"))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, reg in zip(axes, SHAP_REGIONS):
+        rows = mlat_to_indices(reg["mlat_low"], reg["mlat_high"])
+        cols = mlt_to_indices(reg["mlt_start"], reg["mlt_end"])
+        plot_shap_region(rows=rows, cols=cols, label=reg["label"],
+                         field=field, ax=ax, show=False)
+        ax.set_title(reg["label"], fontsize=10)
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+    for ax in axes[n:]:
+        ax.set_visible(False)
+    plt.tight_layout()
+    plt.show()
+
+
+def testing_polar_plot(samples, time, labels, std_labels=None):
+    """
+    Quick polar plot for sanity-checking model outputs side by side.
+
+    Panels whose label indicates an uncertainty field are drawn on a
+    sequential purple scale starting at zero, with their own colorbar. Mean
+    fields share one symmetric bwr scale so they are directly comparable to
+    each other. The two are never put on a shared scale: a standard deviation
+    is non-negative and a diverging map centred on zero would misrepresent it.
+
+    Detection is by substring ('std', 'sigma', 'uncertainty', case-insensitive)
+    rather than exact match, so 'ACORN Op std' is recognised. Pass std_labels
+    explicitly to override.
+    """
+    if std_labels is None:
+        keys = ("std", "sigma", "uncertainty")
+        is_std = [any(k in str(l).lower() for k in keys) for l in labels]
+    else:
+        is_std = [l in std_labels for l in labels]
 
     theta_ticks = np.linspace(0, 2 * np.pi, 8, endpoint=False)
     rad_ticks   = np.linspace(0, 50, 5, endpoint=False)
     rad_labels  = ['', '80', '70', '60', '50']
 
-    # Shared symmetric colour scale across all panels
-    scale     = max(np.max(np.abs(sample)) for sample in samples)
+    # Symmetric scale over the mean panels only -- including a non-negative
+    # std here would inflate the range and wash out the mean fields.
+    mean_samples = [s for s, f in zip(samples, is_std) if not f]
+    if mean_samples:
+        scale = max(np.nanmax(np.abs(s)) for s in mean_samples)
+        scale = scale if scale > 0 else 1.0
+    else:
+        scale = 1.0
     scale_map = mpl.colors.Normalize(vmin=-scale, vmax=scale)
+
+    # Std panels share their own scale, anchored at zero.
+    std_samples = [s for s, f in zip(samples, is_std) if f]
+    if std_samples:
+        std_max = max(np.nanmax(s) for s in std_samples)
+        std_map = mpl.colors.Normalize(vmin=0, vmax=std_max if std_max > 0 else 1.0)
+    else:
+        std_map = None
 
     fig, axes = plt.subplots(
         ncols=len(samples), nrows=1,
@@ -1410,7 +2946,7 @@ def testing_polar_plot(samples, time, labels):
         subplot_kw=dict(projection='polar'),
     )
     if len(samples) == 1:
-        axes = [axes]
+        axes = np.array([axes])
 
     ts_str = time.strftime("%Y-%m-%d %H:%M UT") if hasattr(time, "strftime") else str(time)
     plt.suptitle(ts_str, fontsize=20)
@@ -1420,22 +2956,35 @@ def testing_polar_plot(samples, time, labels):
         np.linspace(0, 2 * np.pi, 24, endpoint=False),
     )
 
-    for ax, sample, label in zip(axes, samples, labels):
+    mean_handle, std_handle = None, None
+    mean_axes, std_axes = [], []
+
+    for ax, sample, label, flag in zip(axes, samples, labels, is_std):
         ax.set_title(label)
         ax.set_theta_zero_location('S')
-        if label == "STD":
-            p = ax.pcolormesh(th, r, sample.T, cmap='Purples')
+        ax.set_theta_direction(1)
+        if flag:
+            std_handle = ax.pcolormesh(th, r, sample.T, cmap='Purples',
+                                       norm=std_map)
+            std_axes.append(ax)
         else:
-            c = ax.pcolormesh(th, r, sample.T, cmap='bwr', norm=scale_map)
+            mean_handle = ax.pcolormesh(th, r, sample.T, cmap='bwr',
+                                        norm=scale_map)
+            mean_axes.append(ax)
         ax.set_xticks(theta_ticks)
         ax.set_xticklabels(['', '3', '', '9', '', '15', '', '21'])
         ax.set_yticks(rad_ticks)
         ax.set_yticklabels(rad_labels)
         ax.set_ylim(0, 35)
 
-    fig.colorbar(c, ax=axes.ravel().tolist(), orientation='vertical')
-    if "STD" in labels:
-        fig.colorbar(p, ax=axes.ravel().tolist(), orientation='horizontal', pad=0.15)
+    if mean_handle is not None:
+        cb = fig.colorbar(mean_handle, ax=mean_axes, orientation='vertical',
+                          fraction=0.046, pad=0.08)
+        cb.set_label(r"FAC ($\mu A/m^2$)")
+    if std_handle is not None:
+        cb = fig.colorbar(std_handle, ax=std_axes, orientation='vertical',
+                          fraction=0.046, pad=0.08)
+        cb.set_label(r"$\sigma$ ($\mu A/m^2$)")
     plt.show()
 
 

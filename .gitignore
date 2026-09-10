@@ -223,6 +223,7 @@ correlation_length.py
 spatial_correlation.py
 storm_time_list.csv
 notes.txt
+compare_prepared_vs_inference.ipynb
 
 # folders that are too big
 plots/
